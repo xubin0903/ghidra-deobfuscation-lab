@@ -1,0 +1,30 @@
+# Binary installs and download cache (too large for git)
+/dist/
+/ghidra/
+/jdk/
+
+# Local Ghidra projects and test binaries stay local; keep only their READMEs
+/projects/*
+!/projects/README.md
+/samples/*
+!/samples/README.md
+
+# Ghidra user project artifacts if they leak into the tree
+*.gpr
+*.rep/
+*.lock
+*.lock~
+
+# Script outputs (patch logs, recovered graphs) belong next to the target binary, not here
+*.cff-patch.json
+*.cff-kb.json
+
+# Python / editor junk
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+*.log
+Thumbs.db
+Desktop.ini

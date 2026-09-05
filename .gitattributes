@@ -1,0 +1,7 @@
+# Normalise line endings in the repo; check out native.
+* text=auto
+*.java text
+*.py text
+*.md text
+*.ps1 text
+*.json text
