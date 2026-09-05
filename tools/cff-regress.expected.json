@@ -1,0 +1,41 @@
+{
+  "comment": "Baseline for tools/cff-regress.ps1. 'patched' = functions that received patches (verified + reverted); numbers come from CffDeflatten all on a scratch copy of projects/cfftest. Update with -UpdateExpected only after reading the plan diff.",
+  "recorded": "2026-09-06",
+  "fixtures": [
+    {
+      "id": "sample_cff",
+      "folder": "aarch64",
+      "program": "sample_cff.so",
+      "slow": false,
+      "expect": { "patched": 17, "verified": 17, "reverted": 0, "full": 10, "lowConfidence": 2 }
+    },
+    {
+      "id": "sdk_o2",
+      "folder": "aarch64",
+      "program": "sample_modified_ollvm.so",
+      "slow": true,
+      "expect": { "patched": 157, "verified": 157, "reverted": 0, "full": 49, "lowConfidence": 4 }
+    },
+    {
+      "id": "x64",
+      "folder": "x64",
+      "program": "CFF_full_linux64.bin",
+      "slow": false,
+      "expect": { "patched": 7, "verified": 7, "reverted": 0, "full": 7, "lowConfidence": 0 }
+    },
+    {
+      "id": "ezam",
+      "folder": "x64",
+      "program": "ezam",
+      "slow": false,
+      "expect": { "patched": 2, "verified": 2, "reverted": 0, "full": 2, "lowConfidence": 0 }
+    },
+    {
+      "id": "x86",
+      "folder": "x86",
+      "program": "CFF_full.bin",
+      "slow": false,
+      "expect": { "patched": 7, "verified": 7, "reverted": 0, "full": 7, "lowConfidence": 0 }
+    }
+  ]
+}

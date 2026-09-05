@@ -19,6 +19,7 @@ Every script in `scripts/` must have a page here. Folder layout:
 | [ListFunctions](ListFunctions.md) | Java | Analysis | Print every function name + entry + size |
 | [DumpExports](DumpExports.md) | Java | Export | Dump PE/ELF exports as JSON |
 | [HeadlessSummary](HeadlessSummary.md) | Java | Headless | key=value summary for batch logs |
+| [HashMemory](HashMemory.md) | Java | Headless | SHA-256 per memory block + total; byte-exact patch/undo oracle |
 | [FindEncryptedStringRefs](FindEncryptedStringRefs.md) | Java | Deobfuscation | Heuristic: xor/add/rol loops (does **not** decrypt) |
 | [CFFDispatchTracer](CFFDispatchTracer.md) | Java | Deobfuscation | OLLVM/Hikari dispatch-**table** recovery (static, no emu) |
 | [HikariCffIslands](HikariCffIslands.md) | Java | Deobfuscation | Classify reloc-filled dests; bookmark work islands (not CFG rewrite) |

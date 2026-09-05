@@ -110,7 +110,7 @@ patch log: ...\sample_modified_ollvm.so.cff-patch.json   (undo: -postScript CffD
 
 ## Verification (bundled fixtures)
 
-End-to-end tested (apply → re-disassemble → decompile → undo) on scratch copies of the lab project; the project under `projects/` is never written.
+End-to-end tested (apply → re-disassemble → decompile → undo) on scratch copies of the lab project; the project under `projects/` is never written. `tools\cff-regress.ps1` reproduces the table below in one command (and fails loudly when a change makes any number worse or `undo` stops being byte-exact).
 
 | Sample | Arch | Result |
 |---|---|---|

@@ -9,6 +9,20 @@ Launch and fetch wrappers. Always go through these so Ghidra never sees the syst
 | `ghidra-headless.ps1` | `analyzeHeadless.bat` + `-scriptPath` this lab's `scripts\` |
 | `fetch-ghidra.ps1` | Download + SHA-256 + optional extract into `ghidra\` |
 | `fetch-jdk21.ps1` | Download Temurin 21 zip + extract into `jdk\` |
+| `cff-regress.ps1` | One-command regression for the CFF suite: scratch copy of the lab project → `CffDeflatten all` per fixture → counts vs `cff-regress.expected.json` → `undo` → byte-exact check with `HashMemory`. Exit 1 on regression |
+| `cff-regress.expected.json` | The fixture list + recorded baseline numbers the regression compares against |
 | `_common.ps1` | Shared path / env helpers. Dot-source only. |
 
 See [install.md](../docs/install.md) and [headless.md](../docs/headless.md).
+
+## CFF regression
+
+```powershell
+.\tools\cff-regress.ps1                  # all fixtures (~6 min; the -O2 SDK is most of it)
+.\tools\cff-regress.ps1 -Quick           # skip fixtures marked "slow" (~2 min)
+.\tools\cff-regress.ps1 -Only sample_cff,x64
+.\tools\cff-regress.ps1 -KeepScratch     # keep the %TEMP% copy + all logs / patch jsons
+.\tools\cff-regress.ps1 -UpdateExpected  # record the current numbers as the new baseline
+```
+
+Per fixture it reports `patched / verified / reverted / full / partial / lowconf / cave-exhausted / patches / undoExact`. Hard failures (exit 1, scratch kept): fewer verified or more reverted than the baseline, `undo` not byte-exact, patches reported but bytes unchanged, error lines in the log. Warnings: fewer full-mode functions or a changed low-confidence count. Run it before and after every engine change; only update the baseline after reading the plan diff. The fixtures are binaries under `projects/cfftest` that are not in git — anyone without them adds their own to the JSON.

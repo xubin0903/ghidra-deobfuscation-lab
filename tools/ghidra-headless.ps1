@@ -19,6 +19,7 @@ param(
     [string[]]$PreScript,
     [string[]]$PostScript,
     [string[]]$ScriptPath,
+    [string]$ScriptsRoot,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Passthru
 )
@@ -36,8 +37,11 @@ if (-not (Test-Path $bat)) {
 # analyzeHeadless takes ONE -scriptPath with semicolon-separated dirs
 # (multiple -scriptPath flags overwrite; last one wins). Enumerate the scripts
 # tree so a newly added scripts\<category>\ folder is found without editing this.
-$extraScriptPaths = @($ready.ScriptsRoot)
-$extraScriptPaths += (Get-ChildItem -Path $ready.ScriptsRoot -Directory -Recurse -ErrorAction SilentlyContinue |
+# -ScriptsRoot replaces the lab's scripts\ with another tree (the regression
+# harness runs against a frozen copy so the working tree can keep changing).
+$scriptsRoot = if ($ScriptsRoot) { $ScriptsRoot } else { $ready.ScriptsRoot }
+$extraScriptPaths = @($scriptsRoot)
+$extraScriptPaths += (Get-ChildItem -Path $scriptsRoot -Directory -Recurse -ErrorAction SilentlyContinue |
     Select-Object -ExpandProperty FullName)
 if ($ScriptPath) { $extraScriptPaths += $ScriptPath }
 $extraScriptPaths = @($extraScriptPaths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique)

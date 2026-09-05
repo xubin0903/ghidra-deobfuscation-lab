@@ -8,6 +8,7 @@ This repo is a **local Ghidra workstation + script library** consumed by other r
 - Prefer local sources first: Ghidra's own `*-src.zip` under `ghidra\Ghidra\**\lib\` answers most API questions offline.
 - GitHub downloads: `gh` / HTTPS. Never clone the entire NSA source tree into this repo unless asked.
 - Never run a byte-writing script (`CffDeflatten` without `dryRun`, `undo=`) against the shared project under `projects\`; copy the project directory to `%TEMP%` and work on the copy.
+- Any change to `scripts/deobfuscation/Cff*.java` is validated with `tools\cff-regress.ps1` (all fixtures) before it is committed; the baseline in `tools\cff-regress.expected.json` moves only with a reason written in the commit.
 
 ## Layout
 
