@@ -822,6 +822,9 @@ public final class CffCore {
 			exitDerived.put(d.predispatcher, seed);
 		}
 		Set<Address> rawHeads = new HashSet<Address>();
+		// where a chain of jump stubs finally lands, per stub (so a later chain
+		// that runs into an already folded stub knows the end without re-walking it)
+		Map<Address, Address> stubDest = new HashMap<Address, Address>();
 		while (!work.isEmpty() && !monitor.isCancelled()) {
 			Address b = work.remove(work.size() - 1);
 			if (!visited.add(b)) {
@@ -864,6 +867,14 @@ public final class CffCore {
 						chainWrites = true;
 						break;
 					}
+					if (stubDest.containsKey(t) && !w[0]) {
+						// runs into a stub another chain already folded (-O0 ARM: every tree
+						// leaf's `b loopEnd` shares the same `loopEnd: b dispatcher` stub):
+						// this block is a stub too and ends where that one ends
+						chain.add(cur);
+						cur = stubDest.get(t);
+						break;
+					}
 					if (h.tramps.contains(t) || chain.contains(t) || t.equals(cur)) {
 						break; // stub cycle
 					}
@@ -872,6 +883,9 @@ public final class CffCore {
 				}
 				if (!chainWrites && (cur.equals(d.predispatcher) || cur.equals(d.dispatcher) || h.tree.contains(cur))) {
 					h.tramps.addAll(chain);
+					for (Address c : chain) {
+						stubDest.put(c, cur);
+					}
 					if (!chain.isEmpty() && (cur.equals(d.predispatcher) || cur.equals(d.dispatcher))) {
 						h.defaults.add(s); // bare `jmp loopEnd` = switchDefault (never writes the state)
 					}
@@ -884,6 +898,9 @@ public final class CffCore {
 				Integer ci = g.id.get(cur);
 				boolean dominated = di >= 0 && ci != null && dominates(g, di, ci.intValue());
 				Set<String> ex = dominated ? treeNodeExit(program, bbm, cur, monitor, ctx, derived) : null;
+				for (Address c : chain) {
+					stubDest.put(c, cur);
+				}
 				if (ex != null) {
 					h.tree.add(cur);
 					h.tramps.addAll(chain);
@@ -1349,11 +1366,137 @@ public final class CffCore {
 		return false;
 	}
 
+	private static final String[] ARM_CONDS = { "eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge",
+		"lt", "gt", "le" };
+
+	/**
+	 * Condition suffix of an ARM32 predicated non-branch instruction (`cpyne`
+	 * -> ne, `addgt` -> gt), or null when the mnemonic carries none we know
+	 * (an IT-block opener, an `s`-suffixed form we would misread, ...).
+	 */
+	public static String armPredicate(Instruction in) {
+		String m = in.getMnemonicString().toLowerCase();
+		if (m.startsWith("it") || m.length() < 3) {
+			return null;
+		}
+		String tail = m.substring(m.length() - 2);
+		for (int i = 0; i < ARM_CONDS.length; i++) {
+			if (ARM_CONDS[i].equals(tail)) {
+				return tail.equals("hs") ? "cs" : tail.equals("lo") ? "cc" : tail;
+			}
+		}
+		return null;
+	}
+
+	/** N, Z, C, V that make the ARM condition hold (a full assignment, so a whole predicated group stays consistent). */
+	private static int[] armFlagsFor(String cc) {
+		switch (cc) {
+		case "eq": return new int[] { 0, 1, 0, 0 };
+		case "ne": return new int[] { 0, 0, 0, 0 };
+		case "cs": return new int[] { 0, 0, 1, 0 };
+		case "cc": return new int[] { 0, 0, 0, 0 };
+		case "mi": return new int[] { 1, 0, 0, 0 };
+		case "pl": return new int[] { 0, 0, 0, 0 };
+		case "vs": return new int[] { 0, 0, 0, 1 };
+		case "vc": return new int[] { 0, 0, 0, 0 };
+		case "hi": return new int[] { 0, 0, 1, 0 };
+		case "ls": return new int[] { 0, 1, 0, 0 };
+		case "ge": return new int[] { 0, 0, 0, 0 };
+		case "lt": return new int[] { 1, 0, 0, 0 };
+		case "gt": return new int[] { 0, 0, 0, 0 };
+		case "le": return new int[] { 0, 1, 0, 0 };
+		default: return null;
+		}
+	}
+
+	private static String armInverse(String cc) {
+		switch (cc) {
+		case "eq": return "ne";
+		case "ne": return "eq";
+		case "cs": return "cc";
+		case "cc": return "cs";
+		case "mi": return "pl";
+		case "pl": return "mi";
+		case "vs": return "vc";
+		case "vc": return "vs";
+		case "hi": return "ls";
+		case "ls": return "hi";
+		case "ge": return "lt";
+		case "lt": return "ge";
+		case "gt": return "le";
+		case "le": return "gt";
+		default: return null;
+		}
+	}
+
+	/**
+	 * Force an ARM predicate by writing CPSR flags (Ghidra's NG/ZR/CY/OV) so that
+	 * {@code cc} holds or fails; the instruction is then executed normally,
+	 * and every further predicated instruction of the same group (until the
+	 * next flag-setting instruction) sees the same, consistent flags.
+	 */
+	private static boolean forceArmPredicate(EmulatorHelper emu, Program program, String cc, boolean hold) throws Exception {
+		int[] f = armFlagsFor(hold ? cc : armInverse(cc));
+		if (f == null) {
+			return false;
+		}
+		String[] names = { "NG", "ZR", "CY", "OV" };
+		for (int i = 0; i < names.length; i++) {
+			Register r = program.getRegister(names[i]);
+			if (r == null) {
+				return false;
+			}
+			emu.writeRegister(r, BigInteger.valueOf(f[i]));
+		}
+		return true;
+	}
+
+	/** Evaluate an ARM condition against the emulator's current flags (null when the flags are unavailable). */
+	private static Boolean evalArmPredicate(EmulatorHelper emu, Program program, String cc) throws Exception {
+		Register ng = program.getRegister("NG");
+		Register zr = program.getRegister("ZR");
+		Register cy = program.getRegister("CY");
+		Register ov = program.getRegister("OV");
+		if (ng == null || zr == null || cy == null || ov == null) {
+			return null;
+		}
+		boolean n = emu.readRegister(ng).signum() != 0;
+		boolean z = emu.readRegister(zr).signum() != 0;
+		boolean c = emu.readRegister(cy).signum() != 0;
+		boolean v = emu.readRegister(ov).signum() != 0;
+		switch (cc) {
+		case "eq": return Boolean.valueOf(z);
+		case "ne": return Boolean.valueOf(!z);
+		case "cs": return Boolean.valueOf(c);
+		case "cc": return Boolean.valueOf(!c);
+		case "mi": return Boolean.valueOf(n);
+		case "pl": return Boolean.valueOf(!n);
+		case "vs": return Boolean.valueOf(v);
+		case "vc": return Boolean.valueOf(!v);
+		case "hi": return Boolean.valueOf(c && !z);
+		case "ls": return Boolean.valueOf(!c || z);
+		case "ge": return Boolean.valueOf(n == v);
+		case "lt": return Boolean.valueOf(n != v);
+		case "gt": return Boolean.valueOf(!z && n == v);
+		case "le": return Boolean.valueOf(z || n != v);
+		default: return null;
+		}
+	}
+
 	/** Condition code of a select or conditional branch, normalised (eq, ne, g, nz, ...). */
 	public static String condOf(Instruction in) {
 		String m = in.getMnemonicString().toLowerCase();
 		if (m.startsWith("cmov")) {
 			return m.substring(4);
+		}
+		if ("ARM".equals(in.getProgram().getLanguage().getProcessor().toString())) {
+			FlowType ft0 = in.getFlowType();
+			if (ft0 != null && !ft0.isJump() && !ft0.isCall() && !ft0.isTerminal()) {
+				String cc = armPredicate(in);
+				if (cc != null) {
+					return cc; // predicated `cpyne r0,r1`: the select of a 32-bit ARM build
+				}
+			}
 		}
 		FlowType ft = in.getFlowType();
 		if (ft != null && ft.isJump() && ft.isConditional()) {
@@ -1589,6 +1732,7 @@ public final class CffCore {
 		AddressSetView body = r.d.func.getBody();
 		EmulatorHelper emu = null;
 		Set<Address> forcedOnce = new HashSet<Address>();
+		boolean predGroupDecided = false; // ARM32: a predicated group's first member decided the flags; the rest are not forks
 		boolean captureLandings = r.contexts != null;
 		try {
 			// write tracking is what lets a landing snapshot carry the memory the
@@ -1681,6 +1825,9 @@ public final class CffCore {
 					return pr;
 				}
 				FlowType ft = in.getFlowType();
+				if (writesFlags(in) && !isPredicated(program, in)) {
+					predGroupDecided = false; // a new compare: the next predicated instruction is a new fork point
+				}
 				if (ft != null && ft.isCall()) {
 					if (ft.isTerminal()) {
 						pr.stop = "ret";
@@ -1700,9 +1847,38 @@ public final class CffCore {
 				boolean handled = false;
 				if (!inDispatch) {
 					if (isPredicated(program, in)) {
-						// runs concretely; flagged so the node is never patched on a half-explored basis
-						pr.forceFailed = true;
-						pr.note = "predicated instruction not modelled: " + in.getMnemonicString() + " @" + cur;
+						// ARM32 lowers the state select to predicated moves (`moveq r0,#A ;
+						// movne r0,#B`). The FIRST predicated instruction after a flag write
+						// is the fork point; it is forced by synthesising the CPSR flags, so
+						// the rest of the group executes consistently with the same predicate.
+						String cc = armPredicate(in);
+						if (cc == null) {
+							pr.forceFailed = true;
+							pr.note = "predicated instruction not modelled: " + in.getMnemonicString() + " @" + cur;
+						}
+						else if (!predGroupDecided) {
+							noteFork(pr, cur, "select");
+							Boolean force = forceAt.get(cur);
+							if (force != null && !forcedOnce.add(cur)) {
+								force = null;
+							}
+							if (force != null) {
+								if (forceArmPredicate(emu, program, cc, force.booleanValue())) {
+									predGroupDecided = true;
+								}
+								else {
+									pr.forceFailed = true;
+									pr.note = "cannot force predicate " + cc + " @" + cur;
+								}
+							}
+							else {
+								Boolean took = evalArmPredicate(emu, program, cc);
+								if (took != null && !pr.concrete.containsKey(cur)) {
+									pr.concrete.put(cur, took);
+								}
+								predGroupDecided = true; // the group is decided; later members are not forks
+							}
+						}
 					}
 					if (isSelectInsn(in)) {
 						noteFork(pr, cur, "select");
@@ -2426,6 +2602,9 @@ public final class CffCore {
 
 	private static final java.util.regex.Pattern SLOT_KEY =
 		java.util.regex.Pattern.compile("^\\[([a-z][a-z0-9]*)(?:[,+]#?(-?0x[0-9a-f]+|-?[0-9]+))?\\]$");
+	private static final java.util.regex.Pattern LITERAL_KEY = java.util.regex.Pattern.compile("^\\[(0x[0-9a-f]+|[0-9]+)\\]$");
+	/** A read of the literal pool: aliases no frame slot (empty range under a base no register has). */
+	private static final Slot LITERAL = new Slot("<literal>", 0, 0);
 
 	/**
 	 * The frame slot a `[base, #imm]` load/store touches, or null when the
@@ -2438,6 +2617,10 @@ public final class CffCore {
 			return null;
 		}
 		String key = keys.iterator().next();
+		if (LITERAL_KEY.matcher(key).matches()) {
+			// ARM literal-pool load `ldr r1,[0x87d8]`: a constant in read-only code, never a frame slot
+			return LITERAL;
+		}
 		// AArch64 `[x29,#-0xdc]` / `[sp]`, x86 `[rbp+-0x1c]` / `[rsp+0x10]` (keys are lower-case, space-free)
 		java.util.regex.Matcher mt = SLOT_KEY.matcher(key);
 		if (!mt.matches()) {

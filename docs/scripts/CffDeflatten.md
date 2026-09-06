@@ -3,7 +3,7 @@
 **Path:** `scripts/deobfuscation/CffDeflatten.java` (engine: `scripts/deobfuscation/CffCore.java`)
 **Lang:** Java GhidraScript
 **Category:** Deobfuscation
-**Targets:** state-machine CFF (OLLVM / Hikari / goron / **Arkari**), `-O0` through `-O2` (tail-merged) layouts. Patching implemented for **AArch64** and **x86 / x86-64** (validated on the bundled fixtures) and for **ARM32 / Thumb-2** (encoders only — see *Arch support*). Other arches → use [CffRecover](CffRecover.md) for annotations.
+**Targets:** state-machine CFF (OLLVM / Hikari / goron / **Arkari**), `-O0` through `-O2` (tail-merged) layouts. Patching implemented and validated for **AArch64** (ELF and Mach-O), **x86 / x86-64** and **ARM32 (A32)**; **Thumb-2** has encoders but no fixture yet (see *Arch support*). Other arches → use [CffRecover](CffRecover.md) for annotations.
 **Does:** rewrite case-tail branches to their recovered successors so the **Ghidra decompiler produces clean nested if/for** instead of a state machine. Every patched function is re-emulated under several input seeds and compared against the original (`verify`); full-mode functions additionally get a structural check that the dead dispatcher is unreachable. Anything that diverges is rolled back automatically. Writes a patch log for one-command undo.
 
 The aggressive end of the suite. It runs the [CffRecover](CffRecover.md) engine, then **patches bytes** so the dispatcher becomes dead code and the original control flow is restored.
@@ -124,10 +124,14 @@ patch log: ...\sample_modified_ollvm.so.cff-patch.json   (undo: -postScript CffD
 
 ## Verification (bundled fixtures)
 
-End-to-end tested (apply → re-disassemble → decompile → undo) on scratch copies of the lab project; the project under `projects/` is never written. `tools\cff-regress.ps1` reproduces the table below in one command (and fails loudly when a change makes any number worse or `undo` stops being byte-exact).
+End-to-end tested (apply → re-disassemble → decompile → undo) on scratch copies of the lab project; the project under `projects/` is never written. `tools\cff-regress.ps1` reproduces the table below in one command (and fails loudly when a change makes any number worse or `undo` stops being byte-exact). The first five rows are public fixtures anyone can fetch (`tools\fetch-samples.ps1`, see [samples/README.md](../../samples/README.md)); the rest are local.
 
 | Sample | Arch | Result |
 |---|---|---|
+| `check_passwd_arm_flat` (deflat test suite, OLLVM `-fla`, `-O0`) | **ARM32** (ARMv7 A32) | `check_password` + `main`: 2/2 full-mode, 23 in-place patches, verify OK + structural oracle, undo byte-exact. Decompiles to the source's `for` loop and `if (i == 4) { if (sum == 0x1a1 && p[3] > 'c' && p[3] < 'e' && p[0] == 'b') … }` |
+| `check_passwd_x8664_flat` (same source) | x86-64 | 2/2 full-mode, verify OK |
+| `check_passwd_arm64_flat` (same source, iOS test app) | **Mach-O** arm64 (AppleSilicon cspec) | 4/4 flagged functions full-mode (`_check_password`, `_getMD5ofmacho`, `_callback_function`, `viewDidLoad`), verify OK |
+| `target_arm_bogus` / `target_x86_bogus` (OLLVM `-bcf` only) | ARM32 / x86 | **negative test**: no function flagged as CFF, nothing patched |
 | `CFF_full_linux64.bin` | x86-64 `-O0` | 7/7 functions full-mode, verify OK (4 seeds + structural oracle); `target_function` / `calculate_factorial` decompile to source-level `if/else` + `for` |
 | `CFF_full.bin` | x86 `-O0` | 7/7 functions full-mode, verify OK |
 | `ezam` | x86-64 | 2/2 functions full-mode, verify OK |
@@ -140,7 +144,8 @@ End-to-end tested (apply → re-disassemble → decompile → undo) on scratch c
 |---|---|
 | AArch64 | validated on all AArch64 fixtures (`-O0`-like and `-O2` tail-merged) |
 | x86 / x86-64 | validated (`-O0` fixtures) |
-| ARM32 / Thumb-2 | **encoders only, not validated on a real flattened ARM32 binary** (this lab has no fixture). `B` / `B<c>` (A32), `B.W` / `B<c>.W` / 16-bit `B` / `B<c>` (Thumb), mode-aware NOP padding, TMode context per patch site (mixed-mode dispatchers are refused). Predicated state selects (`moveq r4,#K`) are **not modelled** by the engine yet: a case containing one is reported and skipped. Retargeting a conditional tail branch is not implemented for ARM32. Treat any ARM32 run as an experiment: `dryRun` first, keep the patch log |
+| ARM32 (A32) | validated on the public `check_passwd_arm_flat` fixture (ARMv7 `-O0`, OLLVM `-fla`): both functions fully deflattened, verify OK with the structural oracle, undo byte-exact; the decompiler shows the original `for` / `if` chain. The state select of a 32-bit ARM build is a **predicated move** (`cpyne r2,r1` = `movne`), modelled as a fork point: the first predicated instruction after a flag write is forced by synthesising the CPSR flags for its condition (or the inverse), so the rest of the predicated group executes consistently. Encoders: `B` / `B<c>`, TMode context per patch site (mixed-mode dispatchers are refused). Retargeting a conditional tail branch (`bne dispatcher`) is not implemented |
+| Thumb-2 | encoders only (`B.W` / `B<c>.W` / 16-bit `B` / `B<c>`, mode-aware NOP padding), **no fixture yet**; IT-block predication is reported, not modelled. `dryRun` first, keep the patch log |
 | others | not supported; use [CffRecover](CffRecover.md) |
 
 ## Limits

@@ -274,8 +274,8 @@ public class CffDeflatten extends GhidraScript {
 		}
 		if (arch == Arch.ARM32) {
 			tmodeReg = currentProgram.getRegister("TMode");
-			println("NOTE: ARM32/Thumb patching has not been validated on a real flattened ARM32 sample (no fixture in this lab);"
-					+ " encoders are unit-checked only, verify+undo apply as usual. Predicated (moveq-style) state selects are not modelled yet.");
+			println("NOTE: ARM32 (A32) patching is validated on the deflat check_passwd fixture; Thumb-2 has encoders but no fixture yet"
+					+ " (IT-block predication is reported, not modelled). Retargeting a conditional tail branch is not implemented for ARM32.");
 		}
 		if (allowStubs && allowExternal) {
 			externalBase = chooseExternalBase();

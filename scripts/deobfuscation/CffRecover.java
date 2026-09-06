@@ -238,9 +238,19 @@ public class CffRecover extends GhidraScript {
 			else {
 				text = "CFF " + describe(n);
 			}
+			// replace an earlier CFF annotation (re-running after an engine change must not stack them); keep the user's own lines
 			String old = currentProgram.getListing().getComment(CommentType.PRE, h);
-			if (old == null || !old.contains(text)) {
-				currentProgram.getListing().setComment(h, CommentType.PRE, old == null ? text : old + "\n" + text);
+			StringBuilder kept = new StringBuilder();
+			if (old != null) {
+				for (String line : old.split("\n")) {
+					if (!line.startsWith("CFF ")) {
+						kept.append(kept.length() > 0 ? "\n" : "").append(line);
+					}
+				}
+			}
+			String merged = kept.length() == 0 ? text : kept + "\n" + text;
+			if (old == null || !old.equals(merged)) {
+				currentProgram.getListing().setComment(h, CommentType.PRE, merged);
 			}
 			currentProgram.getBookmarkManager().setBookmark(h, BookmarkType.ANALYSIS, "CFF", text);
 			if (labels && !h.equals(r.d.entry)) {

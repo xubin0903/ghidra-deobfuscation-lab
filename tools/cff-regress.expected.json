@@ -36,6 +36,46 @@
       "program": "CFF_full.bin",
       "slow": false,
       "expect": { "patched": 7, "verified": 7, "reverted": 0, "full": 7, "lowConfidence": 0 }
+    },
+    {
+      "id": "arm32_cp",
+      "folder": "arm32",
+      "program": "check_passwd_arm_flat",
+      "source": "cq674350529/deflat test suite (tools/fetch-samples.ps1); ARMv7 -O0, predicated moves as selects",
+      "slow": false,
+      "expect": { "patched": 2, "verified": 2, "reverted": 0, "full": 2, "lowConfidence": 0 }
+    },
+    {
+      "id": "x64_cp",
+      "folder": "x64",
+      "program": "check_passwd_x8664_flat",
+      "source": "cq674350529/deflat test suite",
+      "slow": false,
+      "expect": { "patched": 2, "verified": 2, "reverted": 0, "full": 2, "lowConfidence": 0 }
+    },
+    {
+      "id": "macho_cp",
+      "folder": "aarch64",
+      "program": "check_passwd_arm64_flat",
+      "source": "cq674350529/deflat test suite; Mach-O arm64 (AppleSilicon cspec)",
+      "slow": false,
+      "expect": { "patched": 4, "verified": 4, "reverted": 0, "full": 4, "lowConfidence": 0 }
+    },
+    {
+      "id": "arm32_bcf",
+      "folder": "arm32",
+      "program": "target_arm_bogus",
+      "source": "cq674350529/deflat test suite; bogus control flow only -- negative test, nothing may be flagged as CFF",
+      "slow": false,
+      "expect": { "patched": 0, "verified": 0, "reverted": 0, "full": 0, "lowConfidence": 0 }
+    },
+    {
+      "id": "x86_bcf",
+      "folder": "x86",
+      "program": "target_x86_bogus",
+      "source": "cq674350529/deflat test suite; bogus control flow only -- negative test",
+      "slow": false,
+      "expect": { "patched": 0, "verified": 0, "reverted": 0, "full": 0, "lowConfidence": 0 }
     }
   ]
 }

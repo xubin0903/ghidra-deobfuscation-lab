@@ -84,6 +84,14 @@ function Get-Hash([string]$folder, [string]$program, [string]$tag) {
     return "$sha $fns"
 }
 
+# programs present in the project: "<folder>/<name>" from the .prp descriptors
+$present = @()
+Get-ChildItem (Join-Path $scratch "$ProjectName.rep\idata") -Recurse -Filter '*.prp' -ErrorAction SilentlyContinue | ForEach-Object {
+    $txt = Get-Content $_.FullName -Raw
+    if ($txt -match 'NAME="PARENT" TYPE="string" VALUE="/([^"]*)"' ) { $parent = $Matches[1] } else { $parent = '' }
+    if ($txt -match 'NAME="NAME" TYPE="string" VALUE="([^"]+)"') { $present += "$parent/$($Matches[1])" }
+}
+
 $results = @()
 $failed = $false
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -94,6 +102,13 @@ foreach ($fx in $fixtures) {
     $r = [ordered]@{
         id = $fx.id; program = $fx.program; patched = 0; verified = 0; reverted = 0; lowConfidence = 0
         full = 0; partial = 0; caveExhausted = 0; patches = 0; undoExact = $false; errors = 0; seconds = 0; status = 'ok'; notes = @()
+    }
+    if ($present.Count -gt 0 -and -not ($present -contains "$($fx.folder)/$($fx.program)")) {
+        $r.status = 'SKIP'
+        $r.notes += 'program not in the project (local fixture not available here)'
+        Write-Host "  SKIP  $($r.notes[0])" -ForegroundColor DarkGray
+        $results += [pscustomobject]$r
+        continue
     }
     try {
         $h0 = Get-Hash $fx.folder $fx.program "$($fx.id).0-pristine"
@@ -143,7 +158,7 @@ foreach ($fx in $fixtures) {
     }
     $r.seconds = [int]$t0.Elapsed.TotalSeconds
     if ($r.status -eq 'FAIL') { $failed = $true }
-    $color = switch ($r.status) { 'ok' { 'Green' } 'WARN' { 'Yellow' } default { 'Red' } }
+    $color = switch ($r.status) { 'ok' { 'Green' } 'WARN' { 'Yellow' } 'SKIP' { 'DarkGray' } default { 'Red' } }
     Write-Host ("  {0,-5} patched={1} verified={2} reverted={3} full={4} partial={5} lowconf={6} cave-exhausted={7} patches={8} undoExact={9} {10}s" -f `
         $r.status, $r.patched, $r.verified, $r.reverted, $r.full, $r.partial, $r.lowConfidence, $r.caveExhausted, $r.patches, $r.undoExact, $r.seconds) -ForegroundColor $color
     foreach ($n in $r.notes) { Write-Host "        - $n" -ForegroundColor $color }
@@ -156,7 +171,7 @@ $results | ConvertTo-Json -Depth 4 | Out-File (Join-Path $scratch 'results.json'
 
 if ($UpdateExpected) {
     foreach ($fx in $baseline.fixtures) {
-        $r = $results | Where-Object { $_.id -eq $fx.id } | Select-Object -First 1
+        $r = $results | Where-Object { $_.id -eq $fx.id -and $_.status -ne 'SKIP' } | Select-Object -First 1
         if ($r) {
             $fx.expect = [pscustomobject]@{ patched = $r.patched; verified = $r.verified; reverted = $r.reverted; full = $r.full; lowConfidence = $r.lowConfidence }
         }
