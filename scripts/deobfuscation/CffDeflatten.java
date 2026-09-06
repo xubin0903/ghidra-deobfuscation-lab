@@ -58,6 +58,7 @@
 import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -78,12 +79,15 @@ import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressRangeIterator;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
+import ghidra.program.model.address.AddressSpace;
 import ghidra.program.model.block.BasicBlockModel;
 import ghidra.program.model.block.CodeBlock;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.listing.Instruction;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.FlowType;
 
 public class CffDeflatten extends GhidraScript {
@@ -103,6 +107,12 @@ public class CffDeflatten extends GhidraScript {
 	private boolean verify = true;
 	private boolean keepOnMismatch;
 	private boolean allowStubs = true;
+	private boolean allowExternal = true;   // stubs may go to a new memory block when the dispatcher cave is unusable / too small
+	private Address externalBase;           // where that block would start (chosen once per run, also in dryRun)
+	private StubAllocator external;         // shared pool over [externalBase, externalBase + EXTERNAL_RESERVE)
+	private MemoryBlock externalBlock;      // the block, once created
+	private static final long EXTERNAL_RESERVE = 4L << 20; // address space reserved for planning; the block is sized to what was used
+	private static final String EXTERNAL_BLOCK_NAME = "cff_stubs";
 	private boolean selfTestFlip;   // verifySelfTest: deliberately invert the first select's condition; verify MUST catch it
 	private boolean flipped;
 	private boolean debugTrace;     // debugTrace: on a verify mismatch, print both head sequences and the diverging registers
@@ -124,6 +134,8 @@ public class CffDeflatten extends GhidraScript {
 		CffCore.Recovery r;
 		boolean full;
 		int stubBytes;
+		int externalBytes;      // trampoline bytes placed in the external stub block
+		boolean thumb;          // ARM32: function (and its stubs) run in Thumb mode
 		final List<Patch> patches = new ArrayList<Patch>();
 		final List<String> lines = new ArrayList<String>();   // report rows
 		final List<String> skips = new ArrayList<String>();
@@ -240,6 +252,7 @@ public class CffDeflatten extends GhidraScript {
 		verify = !a.flag("noVerify");
 		keepOnMismatch = a.flag("keepOnMismatch");
 		allowStubs = !a.flag("noStubs");
+		allowExternal = !a.flag("noExternalStubs");
 		selfTestFlip = a.flag("verifySelfTest");
 		debugTrace = a.flag("debugTrace");
 		debugPlan = a.flag("debugPlan");
@@ -263,6 +276,18 @@ public class CffDeflatten extends GhidraScript {
 			tmodeReg = currentProgram.getRegister("TMode");
 			println("NOTE: ARM32/Thumb patching has not been validated on a real flattened ARM32 sample (no fixture in this lab);"
 					+ " encoders are unit-checked only, verify+undo apply as usual. Predicated (moveq-style) state selects are not modelled yet.");
+		}
+		if (allowStubs && allowExternal) {
+			externalBase = chooseExternalBase();
+			if (externalBase != null) {
+				external = new StubAllocator(new AddressSet(externalBase, externalBase.add(EXTERNAL_RESERVE - 1)),
+						risc() ? 4 : 1);
+				println("external stub block: " + EXTERNAL_BLOCK_NAME + " would start @" + externalBase
+						+ " (created only if a stub needs it; noExternalStubs disables)");
+			}
+			else {
+				println("external stub block: no free address range after the image; dispatcher-cave stubs only");
+			}
 		}
 
 		List<Function> targets = new ArrayList<Function>();
@@ -306,10 +331,23 @@ public class CffDeflatten extends GhidraScript {
 			monitor.setMessage("CffDeflatten " + f.getName());
 			CffCore.Recovery r = CffCore.recover(currentProgram, d, monitor);
 			FnPlan p = plan(f, d, r);
+			// the per-head ignore sets for verify must come from the ORIGINAL listing:
+			// a shared-tail hand-off moves the head's killing writes into a stub, so
+			// killedOnEntry() computed after patching would report false mismatches
+			for (Address h : r.nodes.keySet()) {
+				ignoredAt(p, h);
+			}
+			for (Address h : r.watch) {
+				ignoredAt(p, h);
+			}
+			r.trim(); // planning is done with the per-path detail; verification only needs heads + region
 			plans.add(p);
 			println("");
+			String ext = p.externalBytes > 0 ? ", " + p.externalBytes + " bytes in " + EXTERNAL_BLOCK_NAME : "";
 			println("--- " + f.getName() + " @" + f.getEntryPoint() + " dispatcher=" + d.dispatcher + " mode="
-					+ (p.full ? "full (dispatcher becomes code cave, " + p.stubBytes + " stub bytes)" : "partial") + " ---");
+					+ (p.full ? "full (dispatcher becomes code cave, " + p.stubBytes + " stub bytes" + ext + ")"
+							: "partial" + (p.externalBytes > 0 ? " (stubs" + ext + ")" : ""))
+					+ " ---");
 			println("  cases=" + (r.nodes.size() - 1) + " resolved=" + r.resolved + " conditional=" + r.conditional
 					+ " unresolved=" + r.unresolved + " -> planned patches=" + p.patches.size());
 			for (String line : p.lines) {
@@ -325,17 +363,26 @@ public class CffDeflatten extends GhidraScript {
 		}
 
 		println("");
+		int extUsed = external == null ? 0 : external.used();
 		if (dryRun) {
 			println("dryRun: " + totalPatches + " patches across " + plans.size() + " function(s), " + fullFns
 					+ " fully deflattened; nothing written.");
+			if (extUsed > 0) {
+				println("dryRun: would create memory block " + EXTERNAL_BLOCK_NAME + " @" + externalBase + " ("
+						+ externalBlockSize(extUsed) + " bytes) for " + extUsed + " bytes of trampolines");
+			}
 			println("re-run without dryRun to apply. see docs/scripts/CffDeflatten.md");
 			return;
+		}
+		if (extUsed > 0) {
+			createExternalBlock(extUsed);
 		}
 
 		// One function at a time: trace the original, write, re-disassemble, trace
 		// again, compare, revert on mismatch. Patches are function-local (stubs
-		// live in the function's own dead dispatcher), and keeping only one
-		// function's traces alive is what lets a 200+ function run fit in memory.
+		// live in the function's own dead dispatcher or the shared stub block),
+		// and keeping only one function's traces alive is what lets a 200+
+		// function run fit in memory.
 		int applied = 0;
 		int reverted = 0;
 		for (FnPlan p : plans) {
@@ -380,6 +427,14 @@ public class CffDeflatten extends GhidraScript {
 			p.before = null; // traces are large; drop them as soon as the verdict is in
 		}
 		println("applied " + applied + "/" + totalPatches + " patches across " + plans.size() + " function(s)");
+		if (externalBlock != null && !externalBlockInUse()) {
+			// every function that needed the block was reverted: leave no empty block behind
+			String name = externalBlock.getName();
+			if (removeStubBlock(externalBlock)) {
+				println("external stub block " + name + " removed again (no surviving stub uses it)");
+				externalBlock = null;
+			}
+		}
 
 		String logPath = a.get("log");
 		if (logPath == null) {
@@ -428,7 +483,9 @@ public class CffDeflatten extends GhidraScript {
 		if (r.heads.stateIncoming != null && r.heads.stateBase != null && !r.heads.stateIncoming.equals(r.heads.stateBase)) {
 			p.regionDead.add(r.heads.stateBase);
 		}
-		p.stateSlots = CffCore.regionLoadSlots(currentProgram, r.dispatchRegion);
+		// slots that hold the state or a spill of it — NOT every slot the dispatcher
+		// touches: an -O2 tree reloads / spills real PHI values through the frame too
+		p.stateSlots = r.heads.stateSlots;
 		// reloads from these slots are state-derived ONLY when the state itself lives in memory (-O0);
 		// an -O2 tree may reload real spilled values, which must be replayed, not dropped
 		p.derivedSlots = r.heads.stateIncoming == null ? p.stateSlots : Collections.<String> emptySet();
@@ -440,6 +497,7 @@ public class CffDeflatten extends GhidraScript {
 		}
 		if (arch == Arch.ARM32) {
 			thumbFn = isThumbAt(f.getEntryPoint());
+			p.thumb = thumbFn;
 			// every byte we touch or reuse must be in the function's ISA mode
 			for (Address a : r.dispatchRegion.getAddresses(true)) {
 				if (isThumbAt(a) != thumbFn) {
@@ -464,10 +522,41 @@ public class CffDeflatten extends GhidraScript {
 			// verification globally; compareTraces() ignores, per head, only the
 			// registers that head kills on entry (plus the state registers).
 		}
-		// full mode: nothing keeps the dispatcher alive, so its bytes may host stubs
-		p.full = allowStubs && !anyBlocker && r.firstHead != null && !r.dispatchRegion.isEmpty();
+		// Where may stubs go? In full mode the dead dispatcher is the first
+		// choice (keeps the code local); the external stub block takes the
+		// overflow. In partial mode the dispatcher stays live and owns no spare
+		// byte, so stubs can ONLY go to the external block — without it, every
+		// edge that needs a trampoline stays flattened.
+		boolean extOk = allowStubs && allowExternal && external != null && externalInRange(f);
+		if (allowStubs && allowExternal && external != null && !extOk) {
+			p.skips.add("external stub block @" + externalBase + " is out of branch range for this function; dispatcher-cave stubs only");
+		}
+		int align = risc() ? riscAlign() : 1;
+		// full mode: nothing keeps the dispatcher alive, so its bytes may host stubs.
+		// The prologue's own way into the dispatcher must be covered too: either
+		// it is a plain fall-in (firstHead known, redirected by an entry patch) or
+		// the entry block is itself a case whose plan redirects its exit(s).
+		boolean entryCovered = r.firstHead != null;
+		if (!entryCovered) {
+			for (NodePlan np : nps) {
+				if (np.node.head.equals(f.getEntryPoint()) && np.blocker == null && !np.kind.equals("none")) {
+					entryCovered = true;
+				}
+			}
+		}
+		if (!entryCovered) {
+			CffCore.Node en = r.nodes.get(f.getEntryPoint());
+			p.skips.add("prologue exit not redirectable (entry node status=" + (en == null ? "missing" : en.status)
+					+ ", successors=" + (en == null ? "-" : en.succs) + "); partial mode");
+		}
+		p.full = allowStubs && !anyBlocker && entryCovered && !r.dispatchRegion.isEmpty();
 		if (p.full) {
-			StubAllocator alloc = new StubAllocator(r.dispatchRegion, risc() ? riscAlign() : 1);
+			StubAllocator alloc = new StubAllocator(r.dispatchRegion, align);
+			StubAllocator extSnap = null;
+			if (extOk) {
+				alloc.setFallback(external);
+				extSnap = external.copy();
+			}
 			// reserve the dispatcher entry slot(s) used by tails that fall into it
 			List<Address> entries = new ArrayList<Address>();
 			for (NodePlan np : nps) {
@@ -490,18 +579,23 @@ public class CffDeflatten extends GhidraScript {
 				alloc.reserve(at, len);
 			}
 			if (p.full) {
-				String failure = emitAll(p, nps, alloc);
+				int extBefore = external == null ? 0 : external.used();
+				String failure = emitAll(p, nps, alloc, true);
 				if (failure == null) {
 					p.stubBytes = alloc.used();
+					p.externalBytes = external == null ? 0 : external.used() - extBefore;
 					return p;
 				}
 				// something in the full plan did not work out: the dispatcher must
-				// stay intact, so throw the whole plan away and redo it in place only
+				// stay intact, so throw the whole plan away and redo it in partial mode
 				p.patches.clear();
 				p.lines.clear();
 				p.skips.clear();
 				p.stubCache.clear();
-				p.skips.add("full mode abandoned (" + failure + "; code cave " + alloc.capacity() + " bytes, " + alloc.used()
+				if (extSnap != null) {
+					external.restore(extSnap);
+				}
+				p.skips.add("full mode abandoned (" + failure + "; dispatcher cave " + alloc.capacity() + " bytes, " + alloc.used()
 						+ " used); partial mode");
 				p.full = false;
 			}
@@ -509,12 +603,48 @@ public class CffDeflatten extends GhidraScript {
 		if (!anyBlocker && !allowStubs) {
 			p.skips.add("noStubs: dispatcher kept although every case resolved");
 		}
-		emitAll(p, nps, null);
+		StubAllocator palloc = null;
+		if (extOk) {
+			palloc = new StubAllocator(new AddressSet(), align); // no local cave: everything goes external
+			palloc.setFallback(external);
+		}
+		int extBefore = external == null ? 0 : external.used();
+		emitAll(p, nps, palloc, false);
+		p.externalBytes = external == null ? 0 : external.used() - extBefore;
 		return p;
 	}
 
-	/** Emit every node plan; returns null on success, or the reason the (full-mode) plan failed. */
-	private String emitAll(FnPlan p, List<NodePlan> nps, StubAllocator alloc) {
+	/**
+	 * Is the external stub block reachable from this function with a plain
+	 * unconditional branch (B ±128 MiB on AArch64, ±32/16 MiB on ARM/Thumb,
+	 * rel32 on x86)?
+	 */
+	private boolean externalInRange(Function f) {
+		if (externalBase == null) {
+			return false;
+		}
+		long d = Math.abs(externalBase.add(EXTERNAL_RESERVE).subtract(f.getEntryPoint()));
+		long d2 = Math.abs(externalBase.subtract(f.getEntryPoint()));
+		long dist = Math.max(d, d2) + f.getBody().getNumAddresses();
+		switch (arch) {
+		case ARM64:
+			return dist < (1L << 27) - 0x10000;
+		case ARM32:
+			return dist < (thumbFn ? (1L << 24) : (1L << 25)) - 0x10000;
+		case X86:
+			return dist < (1L << 31) - 0x10000;
+		default:
+			return false;
+		}
+	}
+
+	/**
+	 * Emit every node plan. {@code full}: the dispatcher is dead, so its entry
+	 * slots may be redirected and any failure invalidates the whole plan
+	 * (returns the reason). Otherwise the dispatcher stays live: failures are
+	 * recorded as skips, and nothing that writes into the dispatcher is emitted.
+	 */
+	private String emitAll(FnPlan p, List<NodePlan> nps, StubAllocator alloc, boolean full) {
 		for (NodePlan np : nps) {
 			if (np.blocker != null) {
 				if (!np.node.status.equals("ret") && !np.node.status.equals("exit")) {
@@ -527,18 +657,21 @@ public class CffDeflatten extends GhidraScript {
 			}
 			if (np.kind.equals("cond")) {
 				if (np.needStubs && alloc == null) {
-					p.skips.add(np.node.head + ": needs a trampoline (" + stubReason(np) + ") but the dispatcher must stay live");
+					p.skips.add(np.node.head + ": needs a trampoline (" + stubReason(np) + ") but the dispatcher must stay live"
+							+ " and no external stub block is available");
 					continue;
 				}
+				int mark = p.patches.size();
 				try {
-					emitSelect(p, np, alloc);
+					emitSelect(p, np, alloc, full);
 					debugEffects(p, "true path", np.effT);
 					debugEffects(p, "false path", np.effF);
 				}
 				catch (Exception e) {
-					if (alloc != null) {
+					if (full) {
 						return np.node.head + ": " + e.getMessage();
 					}
+					dropPatchesFrom(p, mark); // no orphan stubs for an edge that was not redirected
 					p.skips.add(np.node.head + ": " + e.getMessage());
 				}
 				continue;
@@ -547,22 +680,31 @@ public class CffDeflatten extends GhidraScript {
 			for (EdgePlan e : np.edges) {
 				if (e.needStub && alloc == null) {
 					p.skips.add(np.node.head + " tail " + e.tail + ": needs a trampoline (" + edgeStubReason(e)
-							+ ") but the dispatcher must stay live");
+							+ ") but the dispatcher must stay live and no external stub block is available");
 					continue;
 				}
+				int mark = p.patches.size();
 				try {
-					emitEdge(p, np, e, alloc);
+					emitEdge(p, np, e, alloc, full);
 					debugEffects(p, "edge " + e.tail + " -> " + e.succ, e.eff);
 				}
 				catch (Exception ex) {
-					if (alloc != null) {
+					if (full) {
 						return np.node.head + ": " + ex.getMessage();
 					}
+					dropPatchesFrom(p, mark);
 					p.skips.add(np.node.head + " tail " + e.tail + ": " + ex.getMessage());
 				}
 			}
 		}
 		return null;
+	}
+
+	private void dropPatchesFrom(FnPlan p, int mark) {
+		while (p.patches.size() > mark) {
+			Patch dropped = p.patches.remove(p.patches.size() - 1);
+			p.stubCache.values().remove(dropped.at);
+		}
 	}
 
 	private void debugEffects(FnPlan p, String label, CffCore.PathEffects eff) {
@@ -871,6 +1013,17 @@ public class CffDeflatten extends GhidraScript {
 					if (p.stateSlots.contains(k)) {
 						stateStore = true;
 					}
+				}
+				if (!stateStore && selDstName != null) {
+					// a store OF the freshly selected state (`csel x8 ; str x8,[sp,#0xd0]`) is
+					// a state store whatever slot it uses: nothing outside the dispatcher reads the state
+					Set<String> vals = new HashSet<String>();
+					for (String s : ins) {
+						if (!isFrameRegName(s)) {
+							vals.add(s);
+						}
+					}
+					stateStore = vals.size() == 1 && vals.contains(selDstName);
 				}
 				if (stateStore) {
 					drop[i] = true;
@@ -1453,7 +1606,7 @@ public class CffDeflatten extends GhidraScript {
 	}
 
 	/** Redirect one tail to its successor (via a stub replaying the dispatcher copies when there are any). */
-	private void emitEdge(FnPlan p, NodePlan np, EdgePlan e, StubAllocator alloc) throws Exception {
+	private void emitEdge(FnPlan p, NodePlan np, EdgePlan e, StubAllocator alloc, boolean full) throws Exception {
 		Address succ = e.succ;
 		List<Instruction> live = e.eff.live;
 		Address target = succ;
@@ -1503,6 +1656,17 @@ public class CffDeflatten extends GhidraScript {
 			if (arch == Arch.ARM64) {
 				int orig = (int) currentProgram.getMemory().getInt(at);
 				int enc = a64Retarget(orig, at, target);
+				if (enc == 0 && alloc != null && !target.equals(succ)) {
+					// the stub is beyond the branch's reach (B.cond/CBZ ±1 MiB, TBZ ±32 KiB):
+					// hop through a plain B placed as close as the allocator allows
+					Address hub = alloc.allocate(branchLen());
+					int viaHub = a64Retarget(orig, at, hub);
+					if (viaHub != 0) {
+						addPatch(p, hub, riscB(hub, target, branchLen()), "stub", "hub: -> stub " + target + " for " + at);
+						enc = viaHub;
+						via = via + " (hub " + hub + ")";
+					}
+				}
 				if (enc == 0) {
 					throw new IllegalStateException("cannot retarget conditional branch " + at + " -> " + target);
 				}
@@ -1558,6 +1722,9 @@ public class CffDeflatten extends GhidraScript {
 			return;
 		}
 		// tail that falls into the dispatcher (typically the prologue): redirect the (now dead) dispatcher entry
+		if (!full) {
+			throw new IllegalStateException("tail falls into the dispatcher; its entry slot can only be redirected in full mode");
+		}
 		Address at = e.term.regionEntry;
 		if (risc()) {
 			addPatch(p, at, riscB(at, target, branchLen()), "entry", "dispatcher entry -> " + succ + via);
@@ -1569,10 +1736,9 @@ public class CffDeflatten extends GhidraScript {
 	}
 
 	/** Select-decided case: the select slot becomes B.cc T ; B F (in place or through stubs). */
-	private void emitSelect(FnPlan p, NodePlan np, StubAllocator alloc) throws Exception {
+	private void emitSelect(FnPlan p, NodePlan np, StubAllocator alloc, boolean full) throws Exception {
 		CffCore.Node node = np.node;
 		Instruction sel = np.sel;
-		Instruction term = np.term.insn;
 		// window = [borrowed pre instructions] select .. last owned instruction on the
 		// path (the tail branch itself when the tail is ours, the hand-off when the
 		// tail is shared, the last instruction before the dispatcher when it falls in)
@@ -1605,7 +1771,7 @@ public class CffDeflatten extends GhidraScript {
 			}
 			int pairLen = risc() ? 2 * branchLen() : 11;
 			int leadLen = bytesOf(np.lead);
-			Address cs = alloc.allocate(leadLen + pairLen);
+			Address cs = allocForBcc(alloc, leadLen + pairLen, leadLen, stubT);
 			byte[] cb = new byte[leadLen + pairLen];
 			int off = 0;
 			for (Instruction in : np.lead) {
@@ -1702,23 +1868,29 @@ public class CffDeflatten extends GhidraScript {
 					"false path: " + body.size() + " tail instr(s) + " + np.effF.live.size() + " copy(ies) -> " + F);
 		}
 		byte[] buf = new byte[region];
+		String hubNote = "";
 		if (risc()) {
 			int bl = branchLen();
-			byte[] bcc = riscBcc(start, stubT, cc, bl);
-			System.arraycopy(bcc, 0, buf, 0, bl);
-			if (region >= 2 * bl) {
+			if (region >= 2 * bl && bccInRange(start, stubT)) {
+				byte[] bcc = riscBcc(start, stubT, cc, bl);
+				System.arraycopy(bcc, 0, buf, 0, bl);
 				byte[] b = riscB(start.add(bl), stubF, bl);
 				System.arraycopy(b, 0, buf, bl, bl);
 				riscNopFill(buf, 2 * bl);
 			}
 			else {
-				// only the select slot is ours: the false path continues into the
-				// (now dead) dispatcher entry, so redirect that slot instead
-				if (term != null || np.term.site != null || np.term.regionEntry == null) {
-					throw new IllegalStateException("no room for the false-path branch");
-				}
-				addPatch(p, np.term.regionEntry, riscB(np.term.regionEntry, stubF, bl), "entry",
-						"false path of " + start + " -> " + F);
+				// no room for the pair in place, or the stub is beyond B.cond's reach
+				// (±1 MiB; the external stub block usually is): the select slot becomes
+				// a plain B to a hub that holds `b.cc stubT ; b stubF` next to the stubs.
+				// The condition flags survive the extra B untouched.
+				Address hub = allocForBcc(alloc, 2 * bl, 0, stubT);
+				byte[] hb = new byte[2 * bl];
+				System.arraycopy(riscBcc(hub, stubT, cc, bl), 0, hb, 0, bl);
+				System.arraycopy(riscB(hub.add(bl), stubF, bl), 0, hb, bl, bl);
+				addPatch(p, hub, hb, "stub", "hub: b.cc/b pair for " + start);
+				System.arraycopy(riscB(start, hub, bl), 0, buf, 0, bl);
+				riscNopFill(buf, bl);
+				hubNote = ", hub " + hub;
 			}
 		}
 		else {
@@ -1753,7 +1925,40 @@ public class CffDeflatten extends GhidraScript {
 		addPatch(p, start, buf, "cond", "if(" + cc + ") -> " + T + " else -> " + F + " via stubs");
 		p.lines.add(start + "  cond    if(" + cc + ") -> " + T + " else -> " + F + "   [stubs: " + (tNeeds ? stubT : "-")
 				+ " / " + (fNeeds ? stubF : "-") + ", post=" + np.post.size() + ", copies=" + np.effT.live.size() + "/"
-				+ np.effF.live.size() + "]");
+				+ np.effF.live.size() + hubNote + "]");
+	}
+
+	/** Can a conditional branch at {@code from} reach {@code to}? (AArch64 B.cond ±1 MiB, ARM ±32 MiB, Thumb B<c>.W ±1 MiB, x86 rel32.) */
+	private boolean bccInRange(Address from, Address to) {
+		long d = to.subtract(from);
+		switch (arch) {
+		case ARM64:
+			return Math.abs(d) < (1L << 20) - 16;
+		case ARM32:
+			return Math.abs(d) < (thumbFn ? (1L << 20) : (1L << 25)) - 16;
+		default:
+			return true;
+		}
+	}
+
+	/**
+	 * Allocate {@code len} bytes for a stub whose conditional branch at offset
+	 * {@code bccOffset} must reach {@code bccTarget}. The function-local cave is
+	 * tried first; when the target sits in the far external block, the stub is
+	 * put there as well so the B.cond stays in range.
+	 */
+	private Address allocForBcc(StubAllocator alloc, int len, int bccOffset, Address bccTarget) {
+		Address at = alloc.allocate(len);
+		if (bccInRange(at.add(bccOffset), bccTarget)) {
+			return at;
+		}
+		if (external != null && isExternal(bccTarget)) {
+			Address e = external.allocate(len);
+			if (bccInRange(e.add(bccOffset), bccTarget)) {
+				return e;
+			}
+		}
+		throw new IllegalStateException("B.cond out of range " + at.add(bccOffset) + " -> " + bccTarget);
 	}
 	/** stub = <tail instructions after the select> <dispatcher copies> <branch to target>, all byte-copied. */
 	private byte[] buildStub(Address at, List<Instruction> post, List<Instruction> copies, Address target) throws Exception {
@@ -1784,8 +1989,13 @@ public class CffDeflatten extends GhidraScript {
 		return out;
 	}
 
+	private boolean isExternal(Address at) {
+		return external != null && external.contains(at);
+	}
+
 	private void addPatch(FnPlan p, Address at, byte[] repl, String kind, String desc) throws Exception {
-		if (arch == Arch.ARM32 && isThumbAt(at) != thumbFn) {
+		boolean ext = isExternal(at);
+		if (arch == Arch.ARM32 && !ext && isThumbAt(at) != thumbFn) {
 			throw new IllegalStateException("patch site " + at + " is in the other ISA mode (ARM/Thumb) than the function entry");
 		}
 		for (Patch q : p.patches) {
@@ -1798,7 +2008,10 @@ public class CffDeflatten extends GhidraScript {
 		Patch pt = new Patch();
 		pt.at = at;
 		pt.orig = new byte[repl.length];
-		currentProgram.getMemory().getBytes(at, pt.orig);
+		if (!ext) {
+			currentProgram.getMemory().getBytes(at, pt.orig);
+		}
+		// external stub block: does not exist yet at plan time; it is created zero-filled
 		pt.repl = repl;
 		pt.kind = kind;
 		pt.desc = desc;
@@ -1806,17 +2019,27 @@ public class CffDeflatten extends GhidraScript {
 		p.patches.add(pt);
 	}
 
-	/** First-fit allocator over the dead dispatcher bytes. */
+	/**
+	 * First-fit allocator over the dead dispatcher bytes, with an optional
+	 * fallback pool (the external stub block shared by every function in the
+	 * run) for what does not fit — or for everything, in partial mode, where the
+	 * dispatcher stays live and owns no spare byte.
+	 */
 	private static final class StubAllocator {
 		private final List<long[]> free = new ArrayList<long[]>(); // [start, end) offsets
 		private final Address base;
 		private final int align;
 		private int used;
 		private long capacity;
+		private StubAllocator fallback;
+		private final long lo;
+		private final long hi;
 
 		StubAllocator(AddressSetView region, int align) {
 			this.align = align;
 			Address b = null;
+			long l = Long.MAX_VALUE;
+			long h = Long.MIN_VALUE;
 			AddressRangeIterator it = region.getAddressRanges();
 			while (it.hasNext()) {
 				AddressRange ar = it.next();
@@ -1825,17 +2048,38 @@ public class CffDeflatten extends GhidraScript {
 				}
 				free.add(new long[] { ar.getMinAddress().getOffset(), ar.getMaxAddress().getOffset() + 1 });
 				capacity += ar.getLength();
+				l = Math.min(l, ar.getMinAddress().getOffset());
+				h = Math.max(h, ar.getMaxAddress().getOffset() + 1);
 			}
 			base = b;
+			lo = l;
+			hi = h;
 		}
 
 		long capacity() {
 			return capacity;
 		}
 
+		void setFallback(StubAllocator f) {
+			fallback = f;
+		}
+
+		/** Does this allocator's own span cover {@code at}? */
+		boolean contains(Address at) {
+			if (base == null || !at.getAddressSpace().equals(base.getAddressSpace())) {
+				return false;
+			}
+			long o = at.getOffset();
+			return o >= lo && o < hi;
+		}
+
 		private StubAllocator(StubAllocator o) {
 			this.align = o.align;
 			this.base = o.base;
+			this.lo = o.lo;
+			this.hi = o.hi;
+			this.capacity = o.capacity;
+			this.fallback = o.fallback;
 			for (long[] r : o.free) {
 				free.add(new long[] { r[0], r[1] });
 			}
@@ -1844,6 +2088,15 @@ public class CffDeflatten extends GhidraScript {
 
 		StubAllocator copy() {
 			return new StubAllocator(this);
+		}
+
+		/** Roll this allocator back to an earlier {@link #copy()} (a plan that was abandoned). */
+		void restore(StubAllocator snapshot) {
+			free.clear();
+			for (long[] r : snapshot.free) {
+				free.add(new long[] { r[0], r[1] });
+			}
+			used = snapshot.used;
 		}
 
 		int used() {
@@ -1890,11 +2143,77 @@ public class CffDeflatten extends GhidraScript {
 					return at;
 				}
 			}
-			throw new IllegalStateException("dispatcher code cave exhausted (" + len + " bytes)");
+			if (fallback != null) {
+				return fallback.allocate(len);
+			}
+			throw new IllegalStateException((base == null ? "no code cave available (dispatcher live, external stubs off)"
+					: "dispatcher code cave exhausted") + " (" + len + " bytes)");
 		}
 	}
 
 	// -------------------------------------------------------------- apply ----
+
+	/**
+	 * First page-aligned address after the last block of the default address
+	 * space, one guard page further. Deterministic, so dryRun and the real run
+	 * plan against the same base.
+	 */
+	private Address chooseExternalBase() {
+		AddressSpace space = currentProgram.getAddressFactory().getDefaultAddressSpace();
+		Address max = null;
+		for (MemoryBlock b : currentProgram.getMemory().getBlocks()) {
+			if (b.isOverlay() || !b.getStart().getAddressSpace().equals(space)) {
+				continue;
+			}
+			if (max == null || b.getEnd().compareTo(max) > 0) {
+				max = b.getEnd();
+			}
+		}
+		if (max == null) {
+			return null;
+		}
+		long page = 0x1000;
+		long off = (Long.divideUnsigned(max.getOffset(), page) + 2) * page;
+		long top = space.getMaxAddress().getOffset(); // may be 0xffff_ffff_ffff_ffff: compare unsigned
+		if (Long.compareUnsigned(off, max.getOffset()) <= 0 || Long.compareUnsigned(off + EXTERNAL_RESERVE, top) >= 0
+				|| Long.compareUnsigned(off + EXTERNAL_RESERVE, off) < 0) {
+			return null;
+		}
+		return space.getAddress(off);
+	}
+
+	private static long externalBlockSize(int used) {
+		return (used + 0xfffL) & ~0xfffL;
+	}
+
+	private void createExternalBlock(int used) throws Exception {
+		Memory mem = currentProgram.getMemory();
+		String name = EXTERNAL_BLOCK_NAME;
+		for (int n = 2; mem.getBlock(name) != null; n++) {
+			name = EXTERNAL_BLOCK_NAME + "_" + n;
+		}
+		long size = externalBlockSize(used);
+		externalBlock = mem.createInitializedBlock(name, externalBase, size, (byte) 0, monitor, false);
+		externalBlock.setRead(true);
+		externalBlock.setWrite(false);
+		externalBlock.setExecute(true);
+		externalBlock.setComment("CffDeflatten trampoline stubs (synthetic; undo= removes this block)");
+		println("created memory block " + name + " @" + externalBase + " (" + size + " bytes) for " + used + " bytes of trampolines");
+	}
+
+	private boolean externalBlockInUse() {
+		for (FnPlan p : plans) {
+			if (!p.applied) {
+				continue;
+			}
+			for (Patch pt : p.patches) {
+				if (isExternal(pt.at)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
 
 	private int apply(FnPlan p) {
 		int ok = 0;
@@ -1903,6 +2222,11 @@ public class CffDeflatten extends GhidraScript {
 				// bytes are defined as instructions; clear the code units first
 				clearListing(pt.at, pt.at.add(pt.repl.length - 1));
 				currentProgram.getMemory().setBytes(pt.at, pt.repl);
+				if (arch == Arch.ARM32 && tmodeReg != null && isExternal(pt.at)) {
+					// the stub block has no ISA context of its own: give the stub the mode of its function
+					currentProgram.getProgramContext().setValue(tmodeReg, pt.at, pt.at.add(pt.repl.length - 1),
+							p.thumb ? BigInteger.ONE : BigInteger.ZERO);
+				}
 				ok++;
 			}
 			catch (Exception e) {
@@ -1919,7 +2243,9 @@ public class CffDeflatten extends GhidraScript {
 			try {
 				clearListing(pt.at, pt.at.add(pt.orig.length - 1));
 				currentProgram.getMemory().setBytes(pt.at, pt.orig);
-				disassemble(pt.at);
+				if (!isExternal(pt.at)) {
+					disassemble(pt.at);
+				}
 			}
 			catch (Exception e) {
 				printerr("  revert failed @" + pt.at + ": " + e.getMessage());
@@ -1969,6 +2295,9 @@ public class CffDeflatten extends GhidraScript {
 						continue;
 					}
 					if (x.regs[k] != y.regs[k]) {
+						if (garbageCopy(p, x, y, k, regs)) {
+							continue;
+						}
 						return seed + "head #" + i + " @" + x.head + ": register " + reg + " original=0x"
 								+ Long.toHexString(x.regs[k]) + " patched=0x" + Long.toHexString(y.regs[k]);
 					}
@@ -1982,6 +2311,26 @@ public class CffDeflatten extends GhidraScript {
 			return "original trace reached no real block under any seed";
 		}
 		return null;
+	}
+
+	/**
+	 * A differing register is still harmless when, in BOTH traces, its value is
+	 * a plain copy (through real-code `mov`s, e.g. -O2 PHI resolution
+	 * `mov x26,x24`) of a register the whole function ignores because the
+	 * dispatcher fills it with state-derived garbage: a copy of garbage is
+	 * garbage. Only the function-wide ignore sets qualify as roots — a register
+	 * merely killed at this head says nothing about the value it held earlier.
+	 */
+	private boolean garbageCopy(FnPlan p, CffCore.TraceEvent x, CffCore.TraceEvent y, int k, List<Register> regs) {
+		if (x.prov == null || y.prov == null) {
+			return false;
+		}
+		int root = x.prov[k];
+		if (root < 0 || root != y.prov[k] || root >= regs.size()) {
+			return false;
+		}
+		String src = regs.get(root).getName();
+		return p.deadRegs.contains(src) || p.stateScratch.contains(src);
 	}
 
 	/**
@@ -2035,9 +2384,12 @@ public class CffDeflatten extends GhidraScript {
 				for (int k = 0; k < names.size(); k++) {
 					String reg = names.get(k).getName();
 					if (x.regs[k] != y.regs[k]) {
-						regs.append(' ').append(reg).append(ignore.contains(reg) ? "(ignored)" : "").append("=0x")
+						boolean skip = ignore.contains(reg);
+						String why = skip ? "(ignored)" : garbageCopy(p, x, y, k, names) ? "(copy of ignored " + names.get(x.prov[k]).getName() + ")" : "";
+						skip = skip || why.length() > 0;
+						regs.append(' ').append(reg).append(why).append("=0x")
 								.append(Long.toHexString(x.regs[k])).append("/0x").append(Long.toHexString(y.regs[k]));
-						if (!ignore.contains(reg)) {
+						if (!skip) {
 							diff = true;
 						}
 					}
@@ -2144,6 +2496,27 @@ public class CffDeflatten extends GhidraScript {
 			reader.close();
 		}
 		JsonArray arr = root.getAsJsonArray("patches");
+		// synthetic stub blocks this run created: their bytes need no restoring, the block goes away
+		List<MemoryBlock> blocks = new ArrayList<MemoryBlock>();
+		AddressSet blockRanges = new AddressSet();
+		if (root.has("blocks")) {
+			JsonArray ba = root.getAsJsonArray("blocks");
+			for (int i = 0; i < ba.size(); i++) {
+				JsonObject o = ba.get(i).getAsJsonObject();
+				Address start = parseAddr(o.get("start").getAsString());
+				MemoryBlock b = start == null ? null : currentProgram.getMemory().getBlock(start);
+				if (b == null) {
+					printerr("  undo: stub block " + o.get("name").getAsString() + " @" + o.get("start").getAsString() + " no longer exists");
+					continue;
+				}
+				if (!b.getName().equals(o.get("name").getAsString())) {
+					printerr("  undo: block @" + start + " is " + b.getName() + ", not " + o.get("name").getAsString() + "; left alone");
+					continue;
+				}
+				blocks.add(b);
+				blockRanges.add(b.getStart(), b.getEnd());
+			}
+		}
 		int restored = 0;
 		Set<Address> fns = new LinkedHashSet<Address>();
 		List<Address> restoredAt = new ArrayList<Address>();
@@ -2153,6 +2526,16 @@ public class CffDeflatten extends GhidraScript {
 			Address at = parseAddr(o.get("at").getAsString());
 			byte[] orig = hexToBytes(o.get("orig").getAsString());
 			if (at == null || orig == null) {
+				continue;
+			}
+			if (blockRanges.contains(at)) {
+				if (o.has("fn")) {
+					Address fn = parseAddr(o.get("fn").getAsString());
+					if (fn != null) {
+						fns.add(fn);
+					}
+				}
+				restored++;
 				continue;
 			}
 			try {
@@ -2187,7 +2570,47 @@ public class CffDeflatten extends GhidraScript {
 				printerr("  undo: re-disassemble " + fun.getName() + ": " + e.getMessage());
 			}
 		}
-		println("undo: restored " + restored + " patches from " + path + " (" + fns.size() + " function(s) re-disassembled)");
+		// after the bodies were recomputed (no branch leads into the block any more)
+		for (MemoryBlock b : blocks) {
+			String name = b.getName();
+			if (removeStubBlock(b)) {
+				println("  undo: removed stub block " + name);
+			}
+		}
+		println("undo: restored " + restored + " patches from " + path + " (" + fns.size() + " function(s) re-disassembled"
+				+ (blocks.isEmpty() ? "" : ", " + blocks.size() + " stub block(s) removed") + ")");
+	}
+
+	/**
+	 * Remove a synthetic stub block. Ghidra deletes every function whose body
+	 * overlaps a removed range, so first take the block out of any body that
+	 * still lists it (a function keeps stub ranges in its body until it is
+	 * re-fixed-up after the stubs are unreachable).
+	 */
+	private boolean removeStubBlock(MemoryBlock b) {
+		AddressSet range = new AddressSet(b.getStart(), b.getEnd());
+		try {
+			java.util.Iterator<Function> it = currentProgram.getFunctionManager().getFunctionsOverlapping(range);
+			List<Function> touching = new ArrayList<Function>();
+			while (it.hasNext()) {
+				touching.add(it.next());
+			}
+			for (Function fun : touching) {
+				if (range.contains(fun.getEntryPoint())) {
+					continue; // a function that starts inside the block goes away with it
+				}
+				AddressSetView body = fun.getBody();
+				if (body.intersects(range)) {
+					fun.setBody(body.subtract(range));
+				}
+			}
+			currentProgram.getMemory().removeBlock(b, monitor);
+			return true;
+		}
+		catch (Exception e) {
+			printerr("  could not remove stub block " + b.getName() + ": " + e.getMessage());
+			return false;
+		}
 	}
 
 	private void writeLog(String path, int applied) throws Exception {
@@ -2204,7 +2627,12 @@ public class CffDeflatten extends GhidraScript {
 					.append("\", \"patches\": ").append(p.patches.size()).append(", \"verify\": \"")
 					.append(esc(p.verifyResult == null ? "skipped" : p.verifyResult)).append("\"}");
 		}
-		sb.append("\n  ],\n  \"patches\": [\n");
+		sb.append("\n  ],\n  \"blocks\": [");
+		if (externalBlock != null) {
+			sb.append("\n    {\"name\": \"").append(esc(externalBlock.getName())).append("\", \"start\": \"")
+					.append(externalBlock.getStart()).append("\", \"size\": ").append(externalBlock.getSize()).append("}\n  ");
+		}
+		sb.append("],\n  \"patches\": [\n");
 		List<Patch> all = new ArrayList<Patch>();
 		for (FnPlan p : plans) {
 			if (p.applied) {

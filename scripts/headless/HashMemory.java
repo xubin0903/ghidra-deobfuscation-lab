@@ -91,8 +91,10 @@ public class HashMemory extends GhidraScript {
 		for (String l : lines) {
 			println(l);
 		}
-		String totalLine = "TOTAL program=" + currentProgram.getName() + " blocks=" + blocks + " bytes=" + totalBytes + " sha256="
-				+ hex(total.digest());
+		// function count rides along: a byte-exact round trip can still lose listing
+		// state (e.g. a removed memory block deletes the functions whose body touched it)
+		String totalLine = "TOTAL program=" + currentProgram.getName() + " blocks=" + blocks + " bytes=" + totalBytes
+				+ " functions=" + currentProgram.getFunctionManager().getFunctionCount() + " sha256=" + hex(total.digest());
 		println(totalLine);
 		if (out != null) {
 			FileWriter w = new FileWriter(out, true);

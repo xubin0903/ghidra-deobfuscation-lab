@@ -75,10 +75,13 @@ function Invoke-Headless([string]$folder, [string]$program, [string[]]$scriptArg
 }
 
 function Get-Hash([string]$folder, [string]$program, [string]$tag) {
+    # returns "sha256 functions" so the round trip is checked for bytes AND listing state
     $lines = Invoke-Headless $folder $program @('HashMemory.java') (Join-Path $scratch "$tag.hash.log")
     $m = $lines | Where-Object { $_ -match '^TOTAL program=.* sha256=([0-9a-f]{64})' } | Select-Object -Last 1
     if (-not $m) { throw "HashMemory produced no TOTAL line for $program ($tag)" }
-    return ([regex]::Match($m, 'sha256=([0-9a-f]{64})')).Groups[1].Value
+    $sha = ([regex]::Match($m, 'sha256=([0-9a-f]{64})')).Groups[1].Value
+    $fns = ([regex]::Match($m, 'functions=(\d+)')).Groups[1].Value
+    return "$sha $fns"
 }
 
 $results = @()
@@ -109,7 +112,7 @@ foreach ($fx in $fixtures) {
         $r.patched = $r.verified + $r.reverted
 
         $h1 = Get-Hash $fx.folder $fx.program "$($fx.id).1-patched"
-        if ($r.patches -gt 0 -and $h1 -eq $h0) { $r.notes += 'patches reported but bytes unchanged'; $r.status = 'FAIL' }
+        if ($r.patches -gt 0 -and $h1.Split(' ')[0] -eq $h0.Split(' ')[0]) { $r.notes += 'patches reported but bytes unchanged'; $r.status = 'FAIL' }
 
         if (Test-Path $patchLog) {
             $undo = Invoke-Headless $fx.folder $fx.program @('CffDeflatten.java', "undo=$patchLog") (Join-Path $scratch "$($fx.id).undo.log")
@@ -117,7 +120,11 @@ foreach ($fx in $fixtures) {
         }
         $h2 = Get-Hash $fx.folder $fx.program "$($fx.id).2-undone"
         $r.undoExact = ($h2 -eq $h0)
-        if (-not $r.undoExact) { $r.notes += "undo is not byte-exact (pristine $($h0.Substring(0,12)) vs undone $($h2.Substring(0,12)))"; $r.status = 'FAIL' }
+        if (-not $r.undoExact) {
+            $r.status = 'FAIL'
+            if ($h2.Split(' ')[0] -ne $h0.Split(' ')[0]) { $r.notes += "undo is not byte-exact (pristine $($h0.Substring(0,12)) vs undone $($h2.Substring(0,12)))" }
+            if ($h2.Split(' ')[1] -ne $h0.Split(' ')[1]) { $r.notes += "function count changed across the round trip (pristine $($h0.Split(' ')[1]) vs undone $($h2.Split(' ')[1]))" }
+        }
         if ($r.errors -gt 0) { $r.notes += "$($r.errors) error line(s) in the deflatten log"; $r.status = 'FAIL' }
 
         # compare with the baseline

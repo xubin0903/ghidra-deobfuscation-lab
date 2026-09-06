@@ -638,8 +638,8 @@ public final class CffCore {
 						}
 					}
 				}
-				if (store) {
-					slotStores.addAll(memOperandKeys(in));
+				if (store && srcDerived) {
+					slotStores.addAll(memOperandKeys(in)); // a spill OF THE STATE; spills of real PHI values are not state slots
 				}
 			}
 			last = in;
@@ -779,6 +779,8 @@ public final class CffCore {
 		public Set<Address> defaults = new HashSet<Address>();  // swDefault-like dead heads
 		public String stateBase;                                // base register the compare tree reads, or null
 		public String stateIncoming;                            // base register the cases write the next state into, or null (memory)
+		/** Frame slots that hold the state or a spill of it (memory operand keys, see {@link #memOperandKeys}). */
+		public Set<String> stateSlots = new HashSet<String>();
 	}
 
 	/**
@@ -897,6 +899,7 @@ public final class CffCore {
 		Collections.sort(h.caseHeads);
 		h.stateBase = ctx.stateBase;
 		h.stateIncoming = ctx.stateIncoming;
+		h.stateSlots.addAll(ctx.stateSlots);
 		return h;
 	}
 
@@ -942,7 +945,13 @@ public final class CffCore {
 				}
 			}
 		}
-		Address[] blocks = { d.dispatcher, d.predispatcher };
+		// Which frame slots hold the state? Only the ones the dispatcher /
+		// pre-dispatcher LOAD into the compare chain (-O0: `ldr x8,[sp,#0xd0] ;
+		// cmp x8,#K`) or STORE a state-derived value into. An -O2 dispatcher
+		// block also reloads a dozen real PHI values from the frame; those slots
+		// are real data and must not be treated as state (a case's `stur wzr,
+		// [x29,#-0x18]` initialising one would be dropped as dead otherwise).
+		Address[] blocks = { d.predispatcher, d.dispatcher };
 		for (int k = 0; k < blocks.length; k++) {
 			if (blocks[k] == null) {
 				continue;
@@ -951,9 +960,69 @@ public final class CffCore {
 			if (cb == null) {
 				continue;
 			}
+			List<Instruction> list = new ArrayList<Instruction>();
 			for (Instruction in : program.getListing().getInstructions(cb, true)) {
-				if (hasLoad(in) || hasStore(in)) {
+				list.add(in);
+			}
+			if (ctx.stateBase == null) {
+				// unknown state register: every slot the block touches may be it (old behaviour)
+				for (Instruction in : list) {
+					if (hasLoad(in) || hasStore(in)) {
+						ctx.stateSlots.addAll(memOperandKeys(in));
+					}
+				}
+				continue;
+			}
+			// backward: registers the compare(s) read, followed to the loads that produced them
+			Set<String> needed = new HashSet<String>();
+			for (int i = list.size() - 1; i >= 0; i--) {
+				Instruction in = list.get(i);
+				Set<String> outs = regNames(in.getResultObjects());
+				Set<String> ins = regNames(in.getInputObjects());
+				String m = in.getMnemonicString().toLowerCase();
+				if (isCompareLike(m) && writesFlags(in)) {
+					for (String s : ins) {
+						if (!isFrameReg(s)) {
+							needed.add(s);
+						}
+					}
+					continue;
+				}
+				if (Collections.disjoint(outs, needed)) {
+					continue;
+				}
+				needed.removeAll(outs);
+				if (hasLoad(in)) {
+					ctx.stateSlots.addAll(memOperandKeys(in)); // the state is reloaded from here
+				}
+				for (String s : ins) {
+					if (!isFrameReg(s)) {
+						needed.add(s);
+					}
+				}
+			}
+			// forward: stores of state-derived values are state spills
+			Set<String> derived = new HashSet<String>();
+			derived.add(ctx.stateBase);
+			if (ctx.stateIncoming != null) {
+				derived.add(ctx.stateIncoming);
+			}
+			for (Instruction in : list) {
+				Set<String> outs = regNames(in.getResultObjects());
+				Set<String> ins = regNames(in.getInputObjects());
+				boolean load = hasLoad(in);
+				boolean srcDerived = !Collections.disjoint(ins, derived)
+						|| (load && !Collections.disjoint(memOperandKeys(in), ctx.stateSlots));
+				if (hasStore(in) && srcDerived) {
 					ctx.stateSlots.addAll(memOperandKeys(in));
+				}
+				if (!outs.isEmpty()) {
+					if (srcDerived) {
+						derived.addAll(outs);
+					}
+					else {
+						derived.removeAll(outs);
+					}
 				}
 			}
 		}
@@ -1040,6 +1109,28 @@ public final class CffCore {
 		 */
 		public boolean lowConfidence;
 		public String confidenceNote = "";
+
+		/**
+		 * Drop the per-path detail (landing contexts, instruction lists per
+		 * edge, tail sets) once a consumer has finished planning with it. A
+		 * 200+ function run keeps every Recovery alive until verification is
+		 * over; the detail is the bulk of that memory and nothing after planning
+		 * reads it. Heads, successors, statuses and the dispatcher region stay.
+		 */
+		public void trim() {
+			contexts = Collections.emptyMap();
+			snap = null;
+			log = Collections.emptyList();
+			for (Node n : nodes.values()) {
+				n.pathTo = Collections.emptyMap();
+				n.tailTo = Collections.emptyMap();
+				n.tailsTo = Collections.emptyMap();
+				n.pathByEdge = Collections.emptyMap();
+				n.caseTraceByEdge = Collections.emptyMap();
+				n.convergingTails = Collections.emptySet();
+				n.directTo = Collections.emptySet();
+			}
+		}
 	}
 
 	public static int MAX_STEPS = 20000;
@@ -2169,6 +2260,38 @@ public final class CffCore {
 				cur = r.nodes.get(cur.succs.get(0));
 			}
 		}
+		// Every case head must be somebody's successor: the flattening pass gave
+		// every original block a state and every original block had a
+		// predecessor, i.e. a state store somewhere. A head nothing leads to
+		// means a decision the exploration never saw — typically a select
+		// hoisted several cases before the node whose successor it decides, so
+		// the alternative value never reached that node's landing contexts.
+		// Patching ANY edge of such a recovery is unsafe (the node with the
+		// missing successor is unknown) unless some node is still unresolved
+		// and may simply own the missing edge.
+		Set<Address> targeted = new HashSet<Address>();
+		boolean allResolved = true;
+		for (Node n : r.nodes.values()) {
+			targeted.addAll(n.succs);
+			targeted.addAll(n.directTo);
+			boolean settled = n.status.equals("uncond") || n.status.equals("cond") || n.status.equals("ret")
+					|| n.status.equals("exit");
+			if (!settled || !n.complete) {
+				allResolved = false;
+			}
+		}
+		if (allResolved) {
+			for (Address h : r.heads.caseHeads) {
+				if (h.equals(r.d.entry) || r.heads.defaults.contains(h) || targeted.contains(h)) {
+					continue;
+				}
+				r.lowConfidence = true;
+				r.confidenceNote = "case head " + h + " is reached by no recovered edge although every case resolved:"
+						+ " a decision the exploration never saw (hoisted select?) or dead code; nothing patched";
+				r.log.add("WARN low confidence: " + r.confidenceNote);
+				return;
+			}
+		}
 	}
 
 	// ------------------------------------------- dispatcher path effects ----
@@ -2279,15 +2402,86 @@ public final class CffCore {
 		return keys;
 	}
 
-	/** Memory slots the dispatcher reads: the state variable(s) and their spill copies. */
-	public static Set<String> regionLoadSlots(Program program, AddressSetView region) {
-		Set<String> slots = new HashSet<String>();
-		for (Instruction in : program.getListing().getInstructions(region, true)) {
-			if (hasLoad(in) || hasStore(in)) {
-				slots.addAll(memOperandKeys(in));
+	/** A frame slot: base register + byte range, for store/load overlap questions on one path. */
+	static final class Slot {
+		final String base;
+		final long lo;
+		final long hi; // exclusive
+
+		Slot(String base, long lo, long hi) {
+			this.base = base;
+			this.lo = lo;
+			this.hi = hi;
+		}
+
+		boolean overlaps(Slot o) {
+			return base.equals(o.base) && lo < o.hi && o.lo < hi;
+		}
+
+		/** Does this slot write every byte of {@code o}? */
+		boolean covers(Slot o) {
+			return base.equals(o.base) && lo <= o.lo && hi >= o.hi;
+		}
+	}
+
+	private static final java.util.regex.Pattern SLOT_KEY =
+		java.util.regex.Pattern.compile("^\\[([a-z][a-z0-9]*)(?:[,+]#?(-?0x[0-9a-f]+|-?[0-9]+))?\\]$");
+
+	/**
+	 * The frame slot a `[base, #imm]` load/store touches, or null when the
+	 * operand is not of that simple shape (register-indexed, several memory
+	 * operands, no register data) — callers treat null as "could be anything".
+	 */
+	static Slot slotOf(Instruction in, boolean isStore) {
+		Set<String> keys = memOperandKeys(in);
+		if (keys.size() != 1) {
+			return null;
+		}
+		String key = keys.iterator().next();
+		// AArch64 `[x29,#-0xdc]` / `[sp]`, x86 `[rbp+-0x1c]` / `[rsp+0x10]` (keys are lower-case, space-free)
+		java.util.regex.Matcher mt = SLOT_KEY.matcher(key);
+		if (!mt.matches()) {
+			return null;
+		}
+		String base = mt.group(1);
+		long off = 0;
+		if (mt.group(2) != null) {
+			String o = mt.group(2);
+			try {
+				boolean neg = o.startsWith("-");
+				if (neg) {
+					o = o.substring(1);
+				}
+				off = o.startsWith("0x") ? Long.parseLong(o.substring(2), 16) : Long.parseLong(o);
+				if (neg) {
+					off = -off;
+				}
+			}
+			catch (NumberFormatException e) {
+				return null;
 			}
 		}
-		return slots;
+		Register baseReg = in.getProgram().getRegister(base);
+		if (baseReg == null) {
+			return null;
+		}
+		base = baseReg.getBaseRegister().getName();
+		// bytes moved = widths of the data registers (stp x25,x30 -> 16, stur w26 -> 4)
+		Object[] objs = isStore ? in.getInputObjects() : in.getResultObjects();
+		long size = 0;
+		for (int i = 0; objs != null && i < objs.length; i++) {
+			if (objs[i] instanceof Register) {
+				Register r = (Register) objs[i];
+				if (r.getBaseRegister().getName().equals(base) || isFrameReg(r.getName())) {
+					continue;
+				}
+				size += Math.max(1, r.getBitLength() / 8);
+			}
+		}
+		if (size == 0) {
+			return null;
+		}
+		return new Slot(base, off, off + size);
 	}
 
 	/**
@@ -2491,6 +2685,7 @@ public final class CffCore {
 		// Track them forward; a register stops being state-derived as soon as
 		// something unrelated is written into it.
 		boolean[] stateDerived = new boolean[n];
+		boolean[] stateSpill = new boolean[n]; // store whose every stored value is state-derived at that point
 		Set<String> derivedRegs = new HashSet<String>(derivedSeed);
 		derivedRegs.addAll(alwaysDead);
 		for (int i = 0; i < n; i++) {
@@ -2498,6 +2693,15 @@ public final class CffCore {
 			boolean fromStateReg = !load && !Collections.disjoint(reads.get(i), derivedRegs);
 			boolean fromStateSlot = load && !stateSlots.isEmpty()
 					&& !Collections.disjoint(memOperandKeys(ins[i]), stateSlots); // reload of the (spilled) state
+			if (store[i]) {
+				Set<String> vals = new HashSet<String>(reads.get(i));
+				for (java.util.Iterator<String> it = vals.iterator(); it.hasNext();) {
+					if (isFrameReg(it.next())) {
+						it.remove();
+					}
+				}
+				stateSpill[i] = !vals.isEmpty() && derivedRegs.containsAll(vals);
+			}
 			if ((fromStateReg || fromStateSlot) && !store[i] && !writes.get(i).isEmpty()) {
 				stateDerived[i] = true;
 				derivedRegs.addAll(writes.get(i));
@@ -2525,25 +2729,80 @@ public final class CffCore {
 		for (int i = 0; i < n; i++) {
 			deadInsn[i] |= noop[i];
 		}
-		Set<String> writtenSoFar = new HashSet<String>();
-		// stack stores of region-internal values are dead spills; stores of
-		// values that were live on entry are real spills the successor may reload
+		// Stack stores. The successor may reload any frame slot the dispatcher
+		// wrote (-O2 spills real values through the tree: `ldp w13,w20,[x29,#-0x18]
+		// ... stur w13,[x29,#-0xdc]` and real code reloads -0xdc later), so a store
+		// is live unless
+		//  (a) it spills a state-derived value (only the dispatcher reads those), or
+		//  (b) a later store on this path overwrites the very same slot before
+		//      anything reads it,
+		// and in both cases only when no later load on the path can read the slot
+		// — a dropped store followed by a replayed load of its slot would read
+		// stale memory. Whether the STORED register was produced inside the
+		// region says nothing: a value loaded from a real slot is real.
+		// The loads that may read each store's slot are collected once; whether
+		// they keep the store alive depends on whether they are live themselves
+		// (a reload of a spilled state copy is dropped, and then so is the
+		// spill), so the store verdict is recomputed inside the fixpoint below.
 		boolean[] liveStore = new boolean[n];
+		boolean[] storeUnknown = new boolean[n];   // slot not understood / base changes: assume read
+		boolean[] overwritten = new boolean[n];
+		List<List<Integer>> readers = new ArrayList<List<Integer>>(n);
 		for (int i = 0; i < n; i++) {
-			if (store[i]) {
-				Set<String> vals = new HashSet<String>(reads.get(i));
-				for (java.util.Iterator<String> it = vals.iterator(); it.hasNext();) {
-					if (isFrameReg(it.next())) {
-						it.remove();
+			readers.add(null);
+			if (!store[i]) {
+				continue;
+			}
+			List<Integer> rd = new ArrayList<Integer>();
+			readers.set(i, rd);
+			Slot s = slotOf(ins[i], true);
+			if (s == null) {
+				storeUnknown[i] = true;
+				continue;
+			}
+			for (int j = i + 1; j < n; j++) {
+				if (writes.get(j).contains(s.base)) {
+					storeUnknown[i] = true; // base register changes: slot identity lost
+					break;
+				}
+				if (hasLoad(ins[j])) {
+					Slot l = slotOf(ins[j], false);
+					if (l == null) {
+						storeUnknown[i] = true;
+						break;
+					}
+					if (l.overlaps(s)) {
+						rd.add(Integer.valueOf(j));
 					}
 				}
-				liveStore[i] = !writtenSoFar.containsAll(vals);
+				if (store[j]) {
+					Slot t = slotOf(ins[j], true);
+					if (t == null) {
+						storeUnknown[i] = true;
+						break;
+					}
+					if (t.covers(s)) {
+						overwritten[i] = true;
+						break;
+					}
+				}
 			}
-			writtenSoFar.addAll(writes.get(i));
 		}
 		boolean changed = true;
 		while (changed) {
 			changed = false;
+			for (int i = 0; i < n; i++) {
+				if (!store[i]) {
+					continue;
+				}
+				boolean readLive = storeUnknown[i];
+				for (Integer j : readers.get(i)) {
+					if (!deadInsn[j.intValue()]) {
+						readLive = true;
+					}
+				}
+				liveStore[i] = readLive || !(stateSpill[i] || overwritten[i]);
+			}
 			for (int i = 0; i < n; i++) {
 				if (deadInsn[i]) {
 					continue;
@@ -2735,6 +2994,14 @@ public final class CffCore {
 		public Address head;
 		public int step;
 		public long[] regs;
+		/**
+		 * Copy provenance: {@code prov[i] = j} when register i currently holds a
+		 * value that arrived through plain register moves from register j (the
+		 * root of the copy chain), -1 when it was computed. Lets the comparison
+		 * treat a real-code copy of dispatcher garbage (`mov x26,x24` where x24
+		 * is a state copy) as garbage too.
+		 */
+		public int[] prov;
 	}
 
 	private static Map<Program, List<Register>> traceRegCache = new HashMap<Program, List<Register>>();
@@ -2817,6 +3084,12 @@ public final class CffCore {
 		Listing listing = program.getListing();
 		AddressSetView body = f.getBody();
 		List<Register> gprs = traceRegisters(program);
+		Map<String, Integer> gprIndex = new HashMap<String, Integer>();
+		for (int i = 0; i < gprs.size(); i++) {
+			gprIndex.put(gprs.get(i).getName(), Integer.valueOf(i));
+		}
+		int[] prov = new int[gprs.size()];
+		Arrays.fill(prov, -1);
 		EmulatorHelper emu = null;
 		try {
 			emu = newEmulator(program, false, seed == null ? (byte) 0 : seed.fill);
@@ -2857,6 +3130,7 @@ public final class CffCore {
 							ev.regs[i] = 0; // unreadable on this language
 						}
 					}
+					ev.prov = prov.clone();
 					out.add(ev);
 				}
 				Instruction in = listing.getInstructionAt(cur);
@@ -2880,6 +3154,10 @@ public final class CffCore {
 							catch (Exception e) {
 								// not writable
 							}
+							Integer k = gprIndex.get(r.getBaseRegister().getName());
+							if (k != null) {
+								prov[k.intValue()] = -1;
+							}
 						}
 					}
 					advancePast(emu, pc, in);
@@ -2888,6 +3166,7 @@ public final class CffCore {
 				if (ft != null && ft.isTerminal()) {
 					break;
 				}
+				trackProvenance(in, gprIndex, prov);
 				if (!emu.step(monitor)) {
 					String err = String.valueOf(emu.getLastError());
 					if (err.toLowerCase().contains("divide")) {
@@ -2912,6 +3191,42 @@ public final class CffCore {
 			}
 		}
 		return out;
+	}
+
+	/**
+	 * Update copy provenance for one instruction about to execute: a plain
+	 * full-width register move makes the destination mirror the source's root;
+	 * every other write is a computed value (root = itself, encoded as -1).
+	 */
+	private static void trackProvenance(Instruction in, Map<String, Integer> gprIndex, int[] prov) {
+		Object[] outs = in.getResultObjects();
+		if (outs == null || outs.length == 0) {
+			return;
+		}
+		String m = in.getMnemonicString().toLowerCase();
+		boolean plain = m.equals("mov") && in.getNumOperands() == 2 && !hasLoad(in) && !hasStore(in) && !writesFlags(in);
+		if (plain) {
+			Register rd = in.getRegister(0);
+			Register rs = in.getRegister(1);
+			if (rd != null && rs != null && rd.getBitLength() == rs.getBitLength()
+					&& rd.getBitLength() == rd.getBaseRegister().getBitLength()) {
+				Integer d = gprIndex.get(rd.getBaseRegister().getName());
+				Integer s = gprIndex.get(rs.getBaseRegister().getName());
+				if (d != null && s != null) {
+					int root = prov[s.intValue()] >= 0 ? prov[s.intValue()] : s.intValue();
+					prov[d.intValue()] = root == d.intValue() ? -1 : root;
+					return;
+				}
+			}
+		}
+		for (int i = 0; i < outs.length; i++) {
+			if (outs[i] instanceof Register) {
+				Integer d = gprIndex.get(((Register) outs[i]).getBaseRegister().getName());
+				if (d != null) {
+					prov[d.intValue()] = -1;
+				}
+			}
+		}
 	}
 
 	// --------------------------------------------------- misc helpers --------

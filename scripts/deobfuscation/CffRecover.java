@@ -158,7 +158,17 @@ public class CffRecover extends GhidraScript {
 		for (int i = 0; i < r.log.size(); i++) {
 			println("  " + r.log.get(i));
 		}
-		println("  prologue -> " + (r.firstHead == null ? "?" : r.firstHead.toString()));
+		CffCore.Node entry = r.nodes.get(d.entry);
+		if (r.firstHead != null) {
+			println("  prologue -> " + r.firstHead);
+		}
+		else if (entry != null && (entry.status.equals("cond") || entry.status.equals("uncond"))) {
+			// the entry block is itself the first case (-O2: the prologue ends in a select)
+			println("  prologue  " + describe(entry));
+		}
+		else {
+			println("  prologue -> ?" + (entry == null ? "" : " (" + entry.status + (entry.note.isEmpty() ? "" : ": " + entry.note) + ")"));
+		}
 		List<Address> heads = new ArrayList<Address>(r.nodes.keySet());
 		Collections.sort(heads);
 		for (int i = 0; i < heads.size(); i++) {

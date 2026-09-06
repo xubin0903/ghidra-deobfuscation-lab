@@ -1,5 +1,5 @@
 {
-  "comment": "Baseline for tools/cff-regress.ps1. 'patched' = functions that received patches (verified + reverted); numbers come from CffDeflatten all on a scratch copy of projects/cfftest. Update with -UpdateExpected only after reading the plan diff.",
+  "comment": "Baseline for tools/cff-regress.ps1. 'patched' = functions that received patches (verified + reverted); numbers come from CffDeflatten all on a scratch copy of projects/cfftest. Update with -UpdateExpected (or by hand) only after reading the plan diff and saying why in the commit.",
   "recorded": "2026-09-06",
   "fixtures": [
     {
@@ -7,14 +7,14 @@
       "folder": "aarch64",
       "program": "sample_cff.so",
       "slow": false,
-      "expect": { "patched": 17, "verified": 17, "reverted": 0, "full": 10, "lowConfidence": 2 }
+      "expect": { "patched": 17, "verified": 17, "reverted": 0, "full": 11, "lowConfidence": 2 }
     },
     {
       "id": "sdk_o2",
       "folder": "aarch64",
       "program": "sample_modified_ollvm.so",
       "slow": true,
-      "expect": { "patched": 157, "verified": 157, "reverted": 0, "full": 49, "lowConfidence": 4 }
+      "expect": { "patched": 227, "verified": 227, "reverted": 0, "full": 152, "lowConfidence": 5 }
     },
     {
       "id": "x64",
