@@ -110,10 +110,12 @@ foreach ($fx in $fixtures) {
         $results += [pscustomobject]$r
         continue
     }
+    # which script this fixture exercises: CffDeflatten (default) or BcfClean
+    $tool = if ($fx.PSObject.Properties['tool'] -and $fx.tool) { $fx.tool } else { 'CffDeflatten' }
     try {
         $h0 = Get-Hash $fx.folder $fx.program "$($fx.id).0-pristine"
         $patchLog = Join-Path $scratch "$($fx.id).patch.json"
-        $out = Invoke-Headless $fx.folder $fx.program @('CffDeflatten.java', 'all', "log=$patchLog") (Join-Path $scratch "$($fx.id).deflatten.log")
+        $out = Invoke-Headless $fx.folder $fx.program @("$tool.java", 'all', "log=$patchLog") (Join-Path $scratch "$($fx.id).deflatten.log")
 
         $r.full = @($out | Where-Object { $_ -match '^--- .* mode=full' }).Count
         $r.partial = @($out | Where-Object { $_ -match '^--- .* mode=partial' }).Count
@@ -121,16 +123,16 @@ foreach ($fx in $fixtures) {
         $r.reverted = @($out | Where-Object { $_ -match '^\s*verify \S+: MISMATCH' }).Count
         $r.lowConfidence = @($out | Where-Object { $_ -match 'LOW CONFIDENCE' }).Count
         $r.caveExhausted = @($out | Where-Object { $_ -match 'code cave exhausted' }).Count
-        $r.errors = @($out | Where-Object { $_ -match '^ERROR\s+REPORT|Exception|^ERROR .*CffDeflatten' -and $_ -notmatch 'Emulation failure' }).Count
-        $applied = $out | Where-Object { $_ -match '^applied (\d+)/(\d+) patches' } | Select-Object -Last 1
-        if ($applied) { $r.patches = [int]([regex]::Match($applied, '^applied (\d+)/')).Groups[1].Value }
+        $r.errors = @($out | Where-Object { $_ -match "^ERROR\s+REPORT|Exception|^ERROR .*$tool" -and $_ -notmatch 'Emulation failure' }).Count
+        $applied = $out | Where-Object { $_ -match '^applied (\d+)(/\d+)? patches' } | Select-Object -Last 1
+        if ($applied) { $r.patches = [int]([regex]::Match($applied, '^applied (\d+)')).Groups[1].Value }
         $r.patched = $r.verified + $r.reverted
 
         $h1 = Get-Hash $fx.folder $fx.program "$($fx.id).1-patched"
         if ($r.patches -gt 0 -and $h1.Split(' ')[0] -eq $h0.Split(' ')[0]) { $r.notes += 'patches reported but bytes unchanged'; $r.status = 'FAIL' }
 
         if (Test-Path $patchLog) {
-            $undo = Invoke-Headless $fx.folder $fx.program @('CffDeflatten.java', "undo=$patchLog") (Join-Path $scratch "$($fx.id).undo.log")
+            $undo = Invoke-Headless $fx.folder $fx.program @("$tool.java", "undo=$patchLog") (Join-Path $scratch "$($fx.id).undo.log")
             if (-not ($undo | Where-Object { $_ -match '^undo: restored' })) { $r.notes += 'undo printed no summary'; $r.status = 'FAIL' }
         }
         $h2 = Get-Hash $fx.folder $fx.program "$($fx.id).2-undone"

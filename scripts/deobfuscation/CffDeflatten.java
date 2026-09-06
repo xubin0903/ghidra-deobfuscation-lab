@@ -170,12 +170,7 @@ public class CffDeflatten extends GhidraScript {
 	 * other way (small positives, all-ones, pointer-like values into the
 	 * emulator's scratch area with non-zero memory).
 	 */
-	private static final CffCore.TraceSeed[] SEEDS = {
-		new CffCore.TraceSeed("zero", new long[] { 0 }, (byte) 0),
-		new CffCore.TraceSeed("small", new long[] { 1, 2, 3, 4, 5, 6, 7, 8 }, (byte) 0x01),
-		new CffCore.TraceSeed("ones", new long[] { -1L }, (byte) 0xFF),
-		new CffCore.TraceSeed("ptr", new long[] { 0x7ff000020000L, 0x7ff000030000L, 0x10, 0x7ff000040000L }, (byte) 0x41),
-	};
+	private static final CffCore.TraceSeed[] SEEDS = CffCore.VERIFY_SEEDS;
 
 	/** The instruction through which a case hands control to the dispatcher on one edge. */
 	private static final class Term {

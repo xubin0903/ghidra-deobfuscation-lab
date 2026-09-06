@@ -1663,7 +1663,7 @@ public final class CffCore {
 		return ps >= 8 ? 0x7ff000000000L : 0x7ff00000L;
 	}
 
-	private static EmulatorHelper newEmulator(Program program, boolean trackWrites, final byte fill) {
+	public static EmulatorHelper newEmulator(Program program, boolean trackWrites, final byte fill) {
 		EmulatorHelper emu = new EmulatorHelper(program);
 		if (trackWrites) {
 			emu.enableMemoryWriteTracking(true);
@@ -1701,7 +1701,7 @@ public final class CffCore {
 		return emu;
 	}
 
-	private static void advancePast(EmulatorHelper emu, Register pc, Instruction in) {
+	public static void advancePast(EmulatorHelper emu, Register pc, Instruction in) {
 		Address next = in.getFallThrough();
 		if (next == null) {
 			next = in.getMaxAddress().add(1);
@@ -3238,6 +3238,14 @@ public final class CffCore {
 			this.fill = fill;
 		}
 	}
+
+	/** The input vectors every verification trace is run under (CffDeflatten, BcfClean): different seeds drive different real branches. */
+	public static final TraceSeed[] VERIFY_SEEDS = {
+		new TraceSeed("zero", new long[] { 0 }, (byte) 0),
+		new TraceSeed("small", new long[] { 1, 2, 3, 4, 5, 6, 7, 8 }, (byte) 0x01),
+		new TraceSeed("ones", new long[] { -1L }, (byte) 0xFF),
+		new TraceSeed("ptr", new long[] { 0x7ff000020000L, 0x7ff000030000L, 0x10, 0x7ff000040000L }, (byte) 0x41),
+	};
 
 	/** Argument registers of the program's default calling convention, in order. */
 	public static List<Register> argRegisters(Program program) {

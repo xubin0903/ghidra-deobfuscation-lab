@@ -14,7 +14,14 @@
 
 ## Scripts in this lab
 
-None yet that patch CFG. When we write one it will live at `scripts/deobfuscation/` and get a `docs/scripts/` page.
+[**BcfClean**](../scripts/BcfClean.md) does steps 1–4 of the manual playbook for the whole program: it finds conditional branches whose condition is a compile-time constant that involves a never-written data global (OLLVM's `x`, `y`), evaluates each once by emulation, rewrites it to `B`/`JMP` or NOP, and re-emulates the function under four input seeds to prove nothing else changed (undo log included). Validated on the deflat test suite's ARMv7 and i386 `-bcf` binaries.
+
+```powershell
+... -PostScript BcfClean.java all dryRun     # plan
+... -PostScript BcfClean.java all            # apply + verify
+```
+
+What it will *not* fold: predicates on runtime values (`argc`, `rdtsc`, hashes) and on globals the program writes somewhere — for those, the manual playbook below still applies. Flattening on top of BCF: run BcfClean first, then [CffDeflatten](../scripts/CffDeflatten.md).
 
 ## Manual playbook
 

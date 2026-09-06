@@ -76,6 +76,24 @@
       "source": "cq674350529/deflat test suite; bogus control flow only -- negative test",
       "slow": false,
       "expect": { "patched": 0, "verified": 0, "reverted": 0, "full": 0, "lowConfidence": 0 }
+    },
+    {
+      "id": "arm32_bcf_clean",
+      "tool": "BcfClean",
+      "folder": "arm32",
+      "program": "target_arm_bogus",
+      "source": "BcfClean on the ARMv7 -bcf fixture: 6 opaque predicates in target_function, 1 in main",
+      "slow": false,
+      "expect": { "patched": 2, "verified": 2, "reverted": 0, "full": 0, "lowConfidence": 0 }
+    },
+    {
+      "id": "x86_bcf_clean",
+      "tool": "BcfClean",
+      "folder": "x86",
+      "program": "target_x86_bogus",
+      "source": "BcfClean on the i386 -O0 -bcf fixture: 20 opaque predicates in target_function, 1 in main",
+      "slow": false,
+      "expect": { "patched": 2, "verified": 2, "reverted": 0, "full": 0, "lowConfidence": 0 }
     }
   ]
 }

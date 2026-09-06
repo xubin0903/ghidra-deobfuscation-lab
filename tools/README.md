@@ -29,4 +29,4 @@ See [install.md](../docs/install.md) and [headless.md](../docs/headless.md).
 
 Per fixture it reports `patched / verified / reverted / full / partial / lowconf / cave-exhausted / patches / undoExact`. Hard failures (exit 1, scratch kept): fewer verified or more reverted than the baseline, `undo` not byte-exact or not function-count-exact, patches reported but bytes unchanged, error lines in the log. Warnings: fewer full-mode functions or a changed low-confidence count. Fixtures whose program is not in the project are skipped, not failed. Run it before and after every engine change; only update the baseline after reading the plan diff.
 
-Five of the fixtures are public and reproducible on any machine (`fetch-samples.ps1` + `import-samples.ps1`, see [samples/README.md](../samples/README.md)); the others are local binaries under `projects/cfftest` that are not redistributed.
+Seven of the fixtures (five CffDeflatten, two BcfClean) are public and reproducible on any machine (`fetch-samples.ps1` + `import-samples.ps1`, see [samples/README.md](../samples/README.md)); the others are local binaries under `projects/cfftest` that are not redistributed.
